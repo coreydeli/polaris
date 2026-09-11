@@ -329,9 +329,10 @@ credentials separately from the state file. The defaults are listed under [Files
 ### AI and Encoder Profiles tabs
 
 The AI tab is covered under [AI provider settings](#ai-provider-settings); the encoder tabs under
-[NVIDIA NVENC Encoder](#nvidia-nvenc-encoder) and [Linux HDR and Main10](#linux-hdr-and-main10),
-with the codec switches (`hevc_mode`, `av1_mode`), the quantisation fallback (`qp`), and the
-software encoder thread floor (`min_threads`) on the encoder pages themselves.
+[NVIDIA NVENC Encoder](#nvidia-nvenc-encoder), [VA-API Encoder](#va-api-encoder),
+[Vulkan Encoder](#vulkan-encoder), and [Linux HDR and Main10](#linux-hdr-and-main10), with the codec
+switches (`hevc_mode`, `av1_mode`), the quantisation fallback (`qp`), and the software encoder thread
+floor (`min_threads`) on the encoder pages themselves.
 
 ## Linux HDR and Main10
 
@@ -386,6 +387,51 @@ Recommended values:
 | `forced` | `1` | Experimental. Use only when comparing against `auto` and explicit engine counts. |
 | `3` | `3` | Experimental. Use only on GPUs known to expose three usable NVENC engines. |
 
+## VA-API Encoder
+
+VA-API is the default hardware-encode path for AMD and Intel Mesa hosts (`encoder = vaapi`). The options
+below apply to every codec Polaris probes over VA-API (H.264, HEVC, and AV1) and are exposed on the
+VA-API encoder tab in the web UI.
+
+The read-only **Hardware codec support** panel at the top of the tab shows what this GPU actually passed
+validation for: the active encoder plus H.264/HEVC/AV1 rows with HDR markers where the probe accepted a
+Main10/P010 configuration. Polaris advertises AV1 to clients whenever this hardware passes AV1 validation
+and falls back to HEVC when it does not, so leave `av1_mode` on its default and let the panel show which
+codecs will actually be used.
+
+### vaapi_rc_mode
+
+Selects FFmpeg's VA-API rate-control mode for all three codecs. `0` (auto) is the default and preserves
+Polaris's historical selection: CBR when a strict RC buffer or an Intel/AV1 path applies, otherwise VBR.
+An explicit value passes through to FFmpeg untouched; if this driver does not support it, every VA-API
+codec probe fails with `Driver does not support <mode> RC mode (supported modes: ...)` and Polaris falls
+back to software encoding rather than silently substituting a different mode.
+
+| Value | Mode | Notes |
+| ---: | --- | --- |
+| `0` | Auto (default) | Historical behavior; picks CBR or VBR from your stream settings. |
+| `1` | CQP | Constant quantisation parameter; ignores the bitrate target. |
+| `2` | CBR | Constant bitrate with VBV compliance where supported. |
+| `3` | VBR | Variable bitrate within the adaptive range. |
+| `4` | ICQ | Intel constant-quality (AVBR); unsupported on current AMD/Mesa drivers. |
+| `5` | QVBR | Quality-based VBR; requires VA-API 1.3 and driver support. |
+| `6` | AVBR | Average-bitrate mode without a hard ceiling; rarely exposed by drivers. |
+
+On an RX 7900 XTX (RADV, navi31) the supported set is CQP, CBR, VBR, and QVBR; modes outside it fail
+the probe as described above.
+
+### vaapi_low_power
+
+Restricts Polaris to the driver's low-power VA-API entrypoint where available. Useful for battery or
+thermal headroom on laptops. When the profile exposes no low-power entrypoint (typical on desktop AMD),
+Polaris logs a warning and continues with the normal entrypoint instead of failing the codec.
+
+### vaapi_blbrc
+
+Enables driver-side block-level bitrate control (`VA_RC_MB`) where the driver exposes it, typical of
+Intel GPUs. Current AMD/Mesa drivers do not report `VA_RC_MB`, so this is a no-op there: FFmpeg logs
+`Driver does not support BLBRC.` and encoding continues normally.
+
 ## Vulkan Encoder
 
 Vulkan Video is an experimental Linux hardware-encode path for drivers that expose the Vulkan Video
@@ -422,6 +468,17 @@ Selects FFmpeg's Vulkan Video latency/quality target. `2` (low latency) is the s
 
 Selects Vulkan Video rate control. `2` (constant bitrate) is the streaming default. `0` lets FFmpeg
 and the driver decide, `1` selects constant-QP mode, and `4` selects variable bitrate.
+
+### vk_quality
+
+Selects the Vulkan Video quality level passed to FFmpeg. `0` uses the driver default and always works;
+higher levels trade encode speed for quality where the driver exposes them. The allowed range is
+`0..maxQualityLevels`, which varies by driver and codec — with verbose logging enabled, Polaris logs
+the driver's maximum as `Encoder max quality: N`. A value above the maximum fails the encoder open with
+`Invalid quality level <n>: allowed range is 0 to <N>`, and because an explicit Vulkan selection is
+strict, Polaris does not fall back to another encoder; lower the value or switch back to `vaapi`.
+
+On an RX 7900 XTX (RADV, navi31) the maximum quality level is 4 for both H.264 and HEVC.
 
 ## AI provider settings
 

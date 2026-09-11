@@ -535,9 +535,12 @@ const tabs = ref([
     name: "VA-API Encoder",
     group: "encoders",
     groupLabel: "Encoder Profiles",
-    summary: "Linux VA-API strict rate-control behavior for AMD and Intel GPUs.",
+    summary: "Linux VA-API rate control, driver features, and strict bitrate compliance for AMD and Intel GPUs.",
     options: {
       "vaapi_strict_rc_buffer": "disabled",
+      "vaapi_rc_mode": "0",
+      "vaapi_low_power": "disabled",
+      "vaapi_blbrc": "disabled",
     },
   },
   {
@@ -549,6 +552,7 @@ const tabs = ref([
     options: {
       "vk_tune": 2,
       "vk_rc_mode": 2,
+      "vk_quality": "0",
     },
   },
   {
