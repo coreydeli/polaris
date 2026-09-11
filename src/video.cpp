@@ -1809,7 +1809,14 @@ namespace video {
       {
         {"idr_interval"s, std::numeric_limits<int>::max()},
         {"tune"s, &config::video.vk.tune},
-        {"rc_mode"s, &config::video.vk.rc_mode},
+        // Config value 0 means auto: FFmpeg's Vulkan auto sentinel is
+        // FF_VK_RC_MODE_AUTO (0xFFFFFFFF), which does not fit in an int option,
+        // so pass the named constant instead; raw 0 would select the driver's
+        // default rate control. Other values are VkVideoEncodeRateControlModeFlagBitsKHR.
+        {"rc_mode"s, [](const config_t &) {
+          return config::video.vk.rc_mode == 0 ? std::string {"auto"} : std::to_string(config::video.vk.rc_mode);
+        }},
+        {"quality"s, &config::video.vk.quality},
         {"units"s, 0},
         {"usage"s, "stream"s},
         {"content"s, "rendered"s},
@@ -1826,7 +1833,14 @@ namespace video {
       {
         {"idr_interval"s, std::numeric_limits<int>::max()},
         {"tune"s, &config::video.vk.tune},
-        {"rc_mode"s, &config::video.vk.rc_mode},
+        // Config value 0 means auto: FFmpeg's Vulkan auto sentinel is
+        // FF_VK_RC_MODE_AUTO (0xFFFFFFFF), which does not fit in an int option,
+        // so pass the named constant instead; raw 0 would select the driver's
+        // default rate control. Other values are VkVideoEncodeRateControlModeFlagBitsKHR.
+        {"rc_mode"s, [](const config_t &) {
+          return config::video.vk.rc_mode == 0 ? std::string {"auto"} : std::to_string(config::video.vk.rc_mode);
+        }},
+        {"quality"s, &config::video.vk.quality},
         {"units"s, 0},
         {"usage"s, "stream"s},
         {"content"s, "rendered"s},
@@ -1843,7 +1857,14 @@ namespace video {
       {
         {"idr_interval"s, std::numeric_limits<int>::max()},
         {"tune"s, &config::video.vk.tune},
-        {"rc_mode"s, &config::video.vk.rc_mode},
+        // Config value 0 means auto: FFmpeg's Vulkan auto sentinel is
+        // FF_VK_RC_MODE_AUTO (0xFFFFFFFF), which does not fit in an int option,
+        // so pass the named constant instead; raw 0 would select the driver's
+        // default rate control. Other values are VkVideoEncodeRateControlModeFlagBitsKHR.
+        {"rc_mode"s, [](const config_t &) {
+          return config::video.vk.rc_mode == 0 ? std::string {"auto"} : std::to_string(config::video.vk.rc_mode);
+        }},
+        {"quality"s, &config::video.vk.quality},
         {"units"s, 0},
         {"usage"s, "stream"s},
         {"content"s, "rendered"s},
@@ -2175,6 +2196,9 @@ namespace video {
       // Common options
       {
         {"async_depth"s, 1},
+        {"rc_mode"s, &config::video.vaapi.rc_mode},
+        {"low_power"s, []() { return config::video.vaapi.low_power ? 1 : 0; }},
+        {"blbrc"s, []() { return config::video.vaapi.blbrc ? 1 : 0; }},
         {"idr_interval"s, std::numeric_limits<int>::max()},
       },
       {},  // SDR-specific options
@@ -2188,6 +2212,9 @@ namespace video {
       // Common options
       {
         {"async_depth"s, 1},
+        {"rc_mode"s, &config::video.vaapi.rc_mode},
+        {"low_power"s, []() { return config::video.vaapi.low_power ? 1 : 0; }},
+        {"blbrc"s, []() { return config::video.vaapi.blbrc ? 1 : 0; }},
         {"sei"s, 0},
         {"idr_interval"s, std::numeric_limits<int>::max()},
       },
@@ -2202,6 +2229,9 @@ namespace video {
       // Common options
       {
         {"async_depth"s, 1},
+        {"rc_mode"s, &config::video.vaapi.rc_mode},
+        {"low_power"s, []() { return config::video.vaapi.low_power ? 1 : 0; }},
+        {"blbrc"s, []() { return config::video.vaapi.blbrc ? 1 : 0; }},
         {"sei"s, 0},
         {"idr_interval"s, std::numeric_limits<int>::max()},
       },

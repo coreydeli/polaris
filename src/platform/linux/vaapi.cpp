@@ -273,6 +273,13 @@ namespace va {
       if (va_entrypoint == VAEntrypointEncSliceLP) {
         BOOST_LOG(info) << "Using LP encoding mode"sv;
         av_dict_set_int(options, "low_power", 1, 0);
+      } else if (config::video.vaapi.low_power) {
+        // The user requested low-power encoding but this profile exposes no
+        // LP entrypoint. FFmpeg would reject the encoder outright on
+        // low_power=1, so drop the flag and continue with the normal
+        // entrypoint instead of failing the codec's probe.
+        BOOST_LOG(warning) << "Low-power VA-API encoding is not available for this profile; continuing with the normal entrypoint"sv;
+        av_dict_set_int(options, "low_power", 0, 0);
       } else {
         BOOST_LOG(info) << "Using normal encoding mode"sv;
       }
@@ -306,9 +313,15 @@ namespace va {
       // When we have to resort to the default 1 second VBV for encoding quality reasons,
       // we stick to CBR in order to avoid encoding huge frames after bitrate undershoots
       // leave headroom available in the RC window.
-      if (config::video.vaapi.strict_rc_buffer ||
-          (vendor && strstr(vendor, "Intel")) ||
-          ctx->codec_id == AV_CODEC_ID_AV1) {
+      // An explicit user rate-control mode passes through to FFmpeg untouched.
+      // A mode this driver doesn't support fails that codec's probe with a loud
+      // log line and the usual fallback, instead of being silently replaced by
+      // an auto-selected one; rc_mode=0 (auto) keeps the historical behavior.
+      if (config::video.vaapi.rc_mode != 0) {
+        BOOST_LOG(info) << "Using user-specified VA-API rate control mode: "sv << config::video.vaapi.rc_mode;
+      } else if (config::video.vaapi.strict_rc_buffer ||
+                 (vendor && strstr(vendor, "Intel")) ||
+                 ctx->codec_id == AV_CODEC_ID_AV1) {
         ctx->rc_buffer_size = ctx->bit_rate * ctx->framerate.den / ctx->framerate.num;
 
         if (rc_attr.value & VA_RC_VBR) {

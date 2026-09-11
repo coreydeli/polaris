@@ -85,11 +85,15 @@ namespace config {
 
     struct {
       bool strict_rc_buffer;
+      int rc_mode;  ///< FFmpeg VA-API rate control mode: 0=auto, 1=CQP, 2=CBR, 3=VBR, 4=ICQ, 5=QVBR, 6=AVBR
+      bool low_power;
+      bool blbrc;
     } vaapi;
 
     struct {
       int tune;
       int rc_mode;
+      int quality;  ///< FFmpeg Vulkan Video encode quality level: 0 = driver default
     } vk;
 
     std::string capture;

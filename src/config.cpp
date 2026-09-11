@@ -566,11 +566,15 @@ namespace config {
 
     {
       false,  // strict_rc_buffer
+      0,     // rc_mode (auto)
+      false, // low_power
+      false, // blbrc
     },  // vaapi
 
     {
       2,  // tune (low latency)
       2,  // rc_mode (CBR)
+      0,  // quality (driver default)
     },  // vk
 
     {},  // capture
@@ -1351,9 +1355,13 @@ namespace config {
     int_f(vars, "vt_realtime", video.vt.vt_realtime, vt::rt_from_view);
 
     bool_f(vars, "vaapi_strict_rc_buffer", video.vaapi.strict_rc_buffer);
+    int_between_f(vars, "vaapi_rc_mode", video.vaapi.rc_mode, {0, 6});
+    bool_f(vars, "vaapi_low_power", video.vaapi.low_power);
+    bool_f(vars, "vaapi_blbrc", video.vaapi.blbrc);
 
     int_f(vars, "vk_tune", video.vk.tune);
     int_f(vars, "vk_rc_mode", video.vk.rc_mode);
+    int_between_f(vars, "vk_quality", video.vk.quality, {0, INT_MAX});
 
     string_f(vars, "capture", video.capture);
     string_f(vars, "encoder", video.encoder);
