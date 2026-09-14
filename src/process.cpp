@@ -36,6 +36,7 @@
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #ifdef __linux__
+  #include "platform/linux/process_environment.h"
   #include <boost/process/v1/env.hpp>
   #include <boost/process/v1/handles.hpp>
   #include <boost/process/v1/io.hpp>
@@ -48,6 +49,7 @@
 // local includes
 #include "client_profiles.h"
 #include "config.h"
+#include "posix_child_reaper.h"
 #include "crypto.h"
 #include "display_device.h"
 #include "file_handler.h"
@@ -202,13 +204,16 @@ namespace proc {
     );
   }
 
-  void session_lifecycle_gate_t::begin_launch() {
+  void session_lifecycle_gate_t::begin_launch(const std::function<void()> &on_admitted) {
     std::unique_lock lock(_mutex);
     _changed.wait(lock, [this]() {
       return _state == state_e::idle && !_stop_waiting && !_launch_to_stop_handoff &&
              _rtsp_setups_in_flight == 0;
     });
     _state = state_e::launching;
+    if (on_admitted) {
+      on_admitted();
+    }
   }
 
   std::optional<std::uint64_t> session_lifecycle_gate_t::capture_launch_generation() const {
@@ -236,7 +241,8 @@ namespace proc {
     return true;
   }
 
-  bool session_lifecycle_gate_t::try_begin_rtsp_launch(std::uint64_t expected_generation) {
+  bool session_lifecycle_gate_t::try_begin_rtsp_launch(
+      std::uint64_t expected_generation, const std::function<void()> &on_admitted) {
     std::unique_lock lock(_mutex);
     _changed.wait(lock, [this]() {
       return _state != state_e::snapshotting && !_launch_to_stop_handoff &&
@@ -246,6 +252,9 @@ namespace proc {
       return false;
     }
     _state = state_e::launching;
+    if (on_admitted) {
+      on_admitted();
+    }
     return true;
   }
 
@@ -272,18 +281,24 @@ namespace proc {
     _changed.notify_all();
   }
 
-  bool session_lifecycle_gate_t::begin_stop() {
+  bool session_lifecycle_gate_t::begin_stop(const std::function<void()> &cancel_launch,
+                                           const std::function<bool()> &admissible) {
     std::unique_lock lock(_mutex);
     _changed.wait(lock, [this]() {
       return _state != state_e::snapshotting && !_launch_to_stop_handoff;
     });
-    if (_state == state_e::stopping || _stop_waiting) {
+    if (_state == state_e::stopping || _stop_waiting || (admissible && !admissible())) {
       return false;
     }
     _stop_waiting = true;
     _last_stop_committed = false;
     ++_generation;
     _changed.notify_all();
+    if (cancel_launch) {
+      lock.unlock();
+      cancel_launch();
+      lock.lock();
+    }
     _changed.wait(lock, [this]() {
       return _state != state_e::launching && _rtsp_setups_in_flight == 0;
     });
@@ -396,9 +411,12 @@ namespace proc {
   session_snapshot_guard_t::session_snapshot_guard_t(session_snapshot_guard_t &&other) noexcept:
       _gate(std::exchange(other._gate, nullptr)) {}
 
-  void session_lifecycle_gate_t::finish_launch() {
+  void session_lifecycle_gate_t::finish_launch(const std::function<void()> &before_release) {
     std::lock_guard lock(_mutex);
     if (_state == state_e::launching) {
+      if (before_release) {
+        before_release();
+      }
       _state = state_e::idle;
       _changed.notify_all();
     }
@@ -6496,9 +6514,12 @@ namespace proc {
   }
 
   void proc_t::launch_input_only(std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
-    _session_lifecycle_gate->begin_launch();
+    auto capture_owner = std::make_shared<const char>();
+    _session_lifecycle_gate->begin_launch([&]() {
+      session_lifecycle_sync().capture_owner.store(capture_owner);
+    });
     auto release_launch = util::fail_guard([this]() {
-      _session_lifecycle_gate->finish_launch();
+      finish_session_launch();
     });
     launch_input_only_impl(std::move(launch_session));
   }
@@ -6523,6 +6544,7 @@ namespace proc {
     allow_client_commands = false;
     placebo = true;
     _launch_session = std::move(launch_session);
+    sync.metadata_capture_owner = sync.capture_owner.load();
     _client_session_report_recorded = false;
     _client_session_report_recorded_at = {};
     _client_session_report_recorded_unique_id.clear();
@@ -6564,7 +6586,8 @@ namespace proc {
         launch_session->virtual_display,
         app.virtual_display,
         launch_session->user_locked_virtual_display,
-        false
+        false,
+        stream_display_policy::host_default_provides_private_display()
       );
       if (effective_selection.empty()) {
         effective_selection = stream_display_policy::configured_selection();
@@ -6635,9 +6658,12 @@ namespace proc {
   }
 
   int proc_t::execute(const ctx_t& app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
-    _session_lifecycle_gate->begin_launch();
+    auto capture_owner = std::make_shared<const char>();
+    _session_lifecycle_gate->begin_launch([&]() {
+      session_lifecycle_sync().capture_owner.store(capture_owner);
+    });
     auto release_launch = util::fail_guard([this]() {
-      _session_lifecycle_gate->finish_launch();
+      finish_session_launch();
     });
     const bool no_active_sessions_at_launch = rtsp_stream::session_count() == 0;
     return execute_impl(app, std::move(launch_session), no_active_sessions_at_launch);
@@ -6645,15 +6671,21 @@ namespace proc {
 
   int proc_t::execute_and_raise(
     const ctx_t& app,
-    std::shared_ptr<rtsp_stream::launch_session_t> launch_session
+    std::shared_ptr<rtsp_stream::launch_session_t> launch_session,
+    const std::function<int()> &publish
   ) {
     const bool no_active_sessions_at_launch = rtsp_stream::session_count() == 0;
     const auto err = execute_impl(app, launch_session, no_active_sessions_at_launch);
     if (!err) {
-      if (!rtsp_stream::launch_session_raise(std::move(launch_session))) {
-        return 409;
+      // execute_impl has released the process metadata mutex. Keep lifecycle
+      // admission while waiting for user interaction, and reauthorize publication.
+      const auto prepare_error = prepare_capture_for_admitted_launch(launch_session);
+      const auto publish_error = prepare_error ? prepare_error : publish();
+      if (publish_error) {
+        launch_session->cancel();
+        terminate_impl(false, true);
+        return publish_error;
       }
-      stream::session::cancel_disconnect_resume_timeout();
       return 0;
     }
     return err;
@@ -6681,6 +6713,11 @@ namespace proc {
       launch_session->encoder_backend_explicit = _launch_session->encoder_backend_explicit;
       launch_session->effective_encoder_backend = _launch_session->effective_encoder_backend;
     }
+#ifdef __linux__
+    // Resume receives a fresh request. Apply the same app display semantics as
+    // execute_impl before comparing it with the normalized active launch.
+    apply_app_display_semantics(_app, *launch_session);
+#endif
     if (launch_session->encoder_backend_explicit &&
         (!_launch_session->encoder_backend_explicit ||
          launch_session->encoder_backend != _launch_session->encoder_backend)) {
@@ -6718,7 +6755,8 @@ namespace proc {
           session->virtual_display,
           _app.virtual_display,
           session->user_locked_virtual_display,
-          false
+          false,
+          stream_display_policy::host_default_provides_private_display()
         );
         return selection.empty() ? stream_display_policy::configured_selection() : selection;
       };
@@ -6764,7 +6802,104 @@ namespace proc {
     return validate_resolved_launch_profile_for_app(_app, launch_session, client_profile);
   }
 
+  int proc_t::prepare_capture_for_admitted_launch(
+      const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session) {
+    if (_session_lifecycle_gate->stop_in_progress()) {
+      return 503;
+    }
+    // Resume keeps the authoritative app/owner record and admits a new capture
+    // attempt. Bind that record before exposing an interactive cancellation.
+    auto &sync = session_lifecycle_sync();
+    std::shared_ptr<rtsp_stream::launch_session_t> authoritative_launch;
+    std::shared_ptr<const char> capture_owner;
+    video::config_t capture_config {};
+    {
+      std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
+      authoritative_launch = _launch_session;
+      if (!authoritative_launch) {
+        return 503;
+      }
+      capture_owner = sync.capture_owner.load();
+      sync.metadata_capture_owner = capture_owner;
+      sync.capture_launch = launch_session;
+      capture_config.capture_generation = capture_generation;
+    }
+#ifdef __linux__
+    if (launch_session->input_only || launch_session->watch_only ||
+        rtsp_stream::session_count() != 0) {
+      return 0;
+    }
+    session_media::pending_start_owner_scope_t pending_owner {capture_owner.get()};
+    if (session_media::pending_start_cancelled(capture_owner.get())) {
+      return 503;
+    }
+    capture_config.width = launch_session->width;
+    capture_config.height = launch_session->height;
+    capture_config.dynamicRange = launch_session->enable_hdr ? 1 : 0;
+    // HTTP admission knows the resolved launch/display rate in millihertz.
+    // Use it provisionally for portal negotiation; ANNOUNCE supplies its own
+    // stream rate later and may renegotiate capture independently of this rate.
+    capture_config.stream_rate = video::rate::from_millihertz(launch_session->fps);
+    capture_config.framerate = static_cast<int>(std::lround(launch_session->fps / 1000.0));
+    std::shared_ptr<void> preparation;
+    if (!video::prepare_capture_for_launch(capture_config, preparation)) {
+      BOOST_LOG(warning) << "process: Desktop capture preparation failed or screen sharing was cancelled"sv;
+      return 503;
+    }
+    if (session_media::pending_start_cancelled(capture_owner.get())) {
+      return 503;
+    }
+    {
+      std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
+      if (_launch_session != authoritative_launch ||
+          capture_generation != capture_config.capture_generation ||
+          sync.capture_owner.load() != capture_owner) {
+        return 503;
+      }
+    }
+    launch_session->capture_preparation.store(std::move(preparation));
+    if (launch_session->is_cancelled()) {
+      launch_session->cancel();
+      return 503;
+    }
+#endif
+    return 0;
+  }
+
+  std::shared_ptr<void> proc_t::cancel_capture_preparation_for_shutdown(
+      const std::string &unique_id, std::string_view expected_token,
+      bool can_launch, bool require_exact_token) {
+#ifdef __linux__
+    // Preparation holds lifecycle admission, but not this metadata mutex.
+    // Check owner/admission before cancelling, including the gap before the portal
+    // registers its first D-Bus request. Rejected stop requests have no effect.
+    auto &sync = session_lifecycle_sync();
+    std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
+    // Preserve the existing owner-certificate exemption from stale tokens.
+    const auto identity = sync.metadata_capture_owner;
+    if (can_launch && _launch_session && !unique_id.empty() &&
+        boost::iequals(_launch_session->unique_id, unique_id) &&
+        identity == sync.capture_owner.load()) {
+      struct fence_t {
+        std::shared_ptr<const char> identity;
+        session_media::pending_start_cancel_owner_t cancellation;
+      };
+      auto cancellation = session_media::cancel_pending_starts(identity.get());
+      return std::make_shared<fence_t>(std::move(identity), std::move(cancellation));
+    }
+#endif
+    return {};
+  }
+
   bool proc_t::raise_session_for_admitted_launch(std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+#ifdef __linux__
+    if (session_media::pending_start_cancelled(session_lifecycle_sync().capture_owner.load().get())) {
+      return false;
+    }
+#endif
+    if (launch_session->is_cancelled() || _session_lifecycle_gate->stop_in_progress()) {
+      return false;
+    }
     if (!rtsp_stream::launch_session_raise(std::move(launch_session))) {
       return false;
     }
@@ -6777,18 +6912,33 @@ namespace proc {
   }
 
   bool proc_t::try_begin_session_launch(std::uint64_t expected_generation) {
-    if (!_session_lifecycle_gate->try_begin_rtsp_launch(expected_generation)) {
+    auto capture_owner = std::make_shared<const char>();
+    if (!_session_lifecycle_gate->try_begin_rtsp_launch(expected_generation, [&]() {
+          session_lifecycle_sync().capture_owner.store(capture_owner);
+        })) {
       return false;
     }
     if (rtsp_stream::session_snapshot({}).pending_sessions > 0) {
-      _session_lifecycle_gate->finish_launch();
+      finish_session_launch();
       return false;
     }
+    // A late cancellation fence from an earlier request cannot poison this
+    // launch, even when both requests refer to the same running app.
     return true;
   }
 
   void proc_t::finish_session_launch() {
-    _session_lifecycle_gate->finish_launch();
+    auto &sync = session_lifecycle_sync();
+    std::shared_ptr<const char> committed_owner;
+    {
+      std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
+      committed_owner = sync.metadata_capture_owner;
+    }
+    // Failed admission may never install new metadata. Restore its prior owner
+    // before opening the gate, so a rejected request cannot strand that app.
+    _session_lifecycle_gate->finish_launch([&]() {
+      sync.capture_owner.store(committed_owner);
+    });
   }
 
   bool proc_t::try_begin_rtsp_setup(std::uint64_t expected_generation) {
@@ -6882,6 +7032,27 @@ namespace proc {
     }
     _steam_big_picture_guard = std::move(runtime);
   }
+#endif
+
+#ifdef __linux__
+  namespace {
+    /**
+     * Publish the pre-override host display policy, so the surfaces that tell a
+     * client what to ask for keep answering for the host while this session's
+     * override holds the live config rewritten. terminate_impl retires it.
+     */
+    void remember_host_display_default(const proc_t &proc) {
+      stream_display_policy::remember_host_default(
+        stream_display_policy::legacy_booleans_t {
+          proc.initial_headless_mode,
+          proc.initial_use_cage_compositor,
+          proc.initial_prefer_gpu_native_capture,
+        },
+        proc.initial_stream_mode,
+        proc.initial_capture
+      );
+    }
+  }  // namespace
 #endif
 
   int proc_t::execute_impl(
@@ -6978,16 +7149,31 @@ namespace proc {
       launch_session->virtual_display ||
       (app.virtual_display && !launch_session->user_locked_virtual_display);
     const auto configured_session_mode = stream_display_policy::configured_selection();
+    const bool host_private = stream_display_policy::host_default_provides_private_display();
     auto session_mode = stream_display_policy::effective_session_selection_for_launch(
       launch_session->stream_mode,
       launch_session->mirror_desktop || app_desktop_mirror_applies(app, *launch_session),
       launch_session->virtual_display,
       app.virtual_display,
       launch_session->user_locked_virtual_display,
-      false
+      false,
+      host_private
     );
     if (session_mode.empty()) {
       session_mode = configured_session_mode;
+    }
+    if (!session_mode.empty() && session_mode != configured_session_mode) {
+      // Name the inputs that moved this session off the host's own topology.
+      // Without this line a silent promotion is indistinguishable in the log
+      // from a choice the operator made, which is how one shipped for six
+      // releases. Printed before the flags below are rewritten from the result.
+      BOOST_LOG(info) << "process: session topology ["sv << session_mode
+                      << "] differs from the host default ["sv << configured_session_mode
+                      << "]; requested=["sv << launch_session->stream_mode
+                      << "] app_virtual_display="sv << (app.virtual_display ? 1 : 0)
+                      << " launch_virtual_display="sv << (launch_session->virtual_display ? 1 : 0)
+                      << " user_locked="sv << (launch_session->user_locked_virtual_display ? 1 : 0)
+                      << " private_host="sv << (host_private ? 1 : 0);
     }
     if (!session_mode.empty()) {
       launch_session->virtual_display =
@@ -7040,6 +7226,7 @@ namespace proc {
       config::video.output_name = initial_display;
       config::video.color_range = initial_color_range;
       config::video.nvenc_tune = initial_nvenc_tune;
+      stream_display_policy::forget_host_default();
     };
 
     bool session_mode_applied = false;
@@ -7066,6 +7253,7 @@ namespace proc {
             config::video.capture = session_capture;
           }
           this->initial_linux_display_saved = true;
+          remember_host_display_default(*this);
           session_mode_applied = true;
           BOOST_LOG(info) << "process: final session stream mode override ["sv << session_mode
                           << "] applied in-memory after optimization; host default restored at teardown"sv;
@@ -7138,6 +7326,7 @@ namespace proc {
     _app_id = util::from_view(app.id);
     _app_name = app.name;
     _launch_session = launch_session;
+    sync.metadata_capture_owner = sync.capture_owner.load();
     _client_session_report_recorded = false;
     _client_session_report_recorded_at = {};
     _client_session_report_recorded_unique_id.clear();
@@ -7250,6 +7439,8 @@ namespace proc {
     preset_request.hdr_requested = launch_session->enable_hdr;
     preset_request.hdr_locked = launch_session->resolved_profile_from_client;
     preset_request.client_profile_hdr = client_profile_hdr;
+    preset_request.client_reports_hdr10_display =
+      launch_session && launch_session->client_reports_hdr10_display;
     preset_request.host_hdr_capable = launch_session->host_hdr_capable;
     if (resolved_optimization.color_range) {
       preset_request.color_range = resolved_optimization.color_range;
@@ -7261,6 +7452,19 @@ namespace proc {
       return it != preset_resolution.fields.end() && it->is_object() ?
         it->value("source", std::string {}) : std::string {};
     };
+    const auto resolved_field_reason = [&](std::string_view field) -> std::string {
+      const auto it = preset_resolution.fields.find(std::string {field});
+      return it != preset_resolution.fields.end() && it->is_object() ?
+        it->value("reason_code", std::string {}) : std::string {};
+    };
+    // Record why HDR ended up where it did, so Doctor can say so later. A saved setting that
+    // turns HDR off stops the client ever requesting it, which means every capability-based
+    // check downstream stays silent and the user is left with no explanation at all.
+    stream_stats::update_hdr_policy(
+      preset_resolution.hdr,
+      resolved_field_reason("hdr"),
+      launch_session->device_name
+    );
     resolved_optimization.display_mode = parsed_display_mode_t {
       preset_resolution.width,
       preset_resolution.height,
@@ -7802,6 +8006,7 @@ namespace proc {
             linux_vdisplay->backend
           );
           this->initial_linux_display_saved = true;
+          remember_host_display_default(*this);
           launch_session->virtual_display = true;
           this->virtual_display = true;
           this->display_name = linux_vdisplay->output_name;
@@ -8771,7 +8976,7 @@ namespace proc {
     start_steam_big_picture_input_guard(_env, steam_guard_snapshot);
 
     if (has_launch_commands) {
-      input::preallocate_gamepad();
+      input::preallocate_gamepad(launch_session ? launch_session->controller_type : 0);
     }
 
     // Start private runtime, then launch detached app commands into it.
@@ -9193,7 +9398,7 @@ namespace proc {
     // calls to bp::wait() and platf::process_group_running() which both
     // invoke waitpid() under the hood.
     auto reaper = util::fail_guard([]() {
-      while (waitpid(-1, nullptr, WNOHANG) > 0);
+      util::posix_children::reap_unowned_children();
     });
 #endif
 
@@ -9451,10 +9656,25 @@ namespace proc {
   }
 
   void proc_t::terminate(bool immediate, bool needs_refresh) {
-    if (!_session_lifecycle_gate->begin_stop()) {
+#ifdef __linux__
+    std::shared_ptr<const char> capture_owner;
+    session_media::pending_start_cancel_owner_t pending_cancel;
+#endif
+    if (!_session_lifecycle_gate->begin_stop([&]() {
+#ifdef __linux__
+          // Admission publishes its owner under the gate lock. Read it after
+          // stop closes admission, then cancel before waiting for the launch.
+          capture_owner = session_lifecycle_sync().capture_owner.load();
+          pending_cancel = session_media::cancel_pending_starts(capture_owner.get());
+#endif
+        })) {
       return;
     }
-    auto release_stop = util::fail_guard([this]() {
+    auto release_stop = util::fail_guard([&]() {
+#ifdef __linux__
+      // Reopen this owner before the lifecycle gate admits the next launch.
+      pending_cancel = {};
+#endif
       _session_lifecycle_gate->finish_stop();
     });
     terminate_impl(immediate, needs_refresh);
@@ -9811,6 +10031,13 @@ namespace proc {
     stream::session::cancel_disconnect_resume_timeout();
     auto &sync = session_lifecycle_sync();
     std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
+    // Retirement can race HTTP publication. Cancel the exact prepared request
+    // (which may be a distinct Resume object) before clearing its app record.
+    // RTSP handoff/start already share this atomic state, without lock nesting.
+    if (auto pending_launch = sync.capture_launch.lock()) {
+      pending_launch->cancel_for_timeout();
+    }
+    sync.capture_launch.reset();
     std::error_code ec;
     placebo = false;
 
@@ -10178,6 +10405,8 @@ namespace proc {
       // re-bake it for the restored host default. Teardown above already ran
       // against the session's effective mode, which is why this sits here.
       platf::reevaluate_capture_sources();
+      // The live config is the host default again, so stop holding a copy of it.
+      stream_display_policy::forget_host_default();
 #endif
     }
 
@@ -10204,6 +10433,7 @@ namespace proc {
     initial_linux_display_saved = false;
     mode_changed_display.clear();
     _launch_session.reset();
+    sync.metadata_capture_owner = sync.capture_owner.load();
     virtual_display = false;
     allow_client_commands = false;
 
@@ -10238,8 +10468,23 @@ namespace proc {
   }
 
 #if defined(POLARIS_TESTS)
+  void proc_t::set_active_launch_for_tests(
+      const ctx_t &app,
+      std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    auto &sync = session_lifecycle_sync();
+    std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
+    _app = app;
+    _app_id = 1;
+    _launch_session = std::move(launch_session);
+    sync.metadata_capture_owner = sync.capture_owner.load();
+  }
+
   std::pair<const void *, const void *> proc_t::session_lifecycle_identity_for_tests() const {
     return {_session_lifecycle_gate.get(), _session_lifecycle_sync.get()};
+  }
+
+  const void *proc_t::capture_preparation_owner_for_tests() const {
+    return session_lifecycle_sync().capture_owner.load().get();
   }
 
   void proc_t::with_session_lifecycle_lock_for_tests(const std::function<void()> &callback) {
@@ -10427,10 +10672,11 @@ namespace proc {
     std::string_view expected_token,
     bool require_exact_token,
     const rtsp_stream::session_snapshot_t &rtsp_snapshot,
-    bool stop_in_progress
+    bool stop_in_progress,
+    bool refresh_running
   ) {
     session_stop_snapshot_t snapshot;
-    snapshot.running_app_id = running();
+    snapshot.running_app_id = refresh_running ? running() : _app_id;
     snapshot.had_running_app = snapshot.running_app_id > 0;
     snapshot.active_sessions = rtsp_snapshot.active_sessions + rtsp_snapshot.pending_sessions;
     snapshot.requester_role = rtsp_snapshot.requester_role;
@@ -10529,13 +10775,42 @@ namespace proc {
       result.snapshot.outcome = session_stop_outcome_t::permission_denied;
       return result;
     }
-    if (!_session_lifecycle_gate->begin_stop()) {
-      result.snapshot.outcome = session_stop_outcome_t::stop_in_progress;
-      result.snapshot.stop_in_progress = true;
+    // Check authority without a snapshot gate: an interactive launch holds
+    // admission, but has released the process mutex. A rejected request must
+    // not announce stop or invalidate that launch's lifecycle generation.
+    std::shared_ptr<const char> expected_capture_owner;
+    const bool admission_stop_in_progress = _session_lifecycle_gate->stop_in_progress();
+    const auto admission_snapshot = rtsp_stream::session_snapshot(unique_id);
+    {
+      auto &sync = session_lifecycle_sync();
+      std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
+      expected_capture_owner = sync.metadata_capture_owner;
+      result.snapshot = get_session_stop_snapshot_locked(
+        unique_id, can_launch, expected_token, require_exact_token,
+        admission_snapshot, admission_stop_in_progress, false);
+      if (result.snapshot.outcome != session_stop_outcome_t::allowed) {
+        return result;
+      }
+      if (expected_capture_owner != sync.capture_owner.load()) {
+        result.snapshot.outcome = session_stop_outcome_t::session_changed;
+        return result;
+      }
+    }
+    std::shared_ptr<void> pending_cancel;
+    if (!_session_lifecycle_gate->begin_stop([&]() {
+          pending_cancel = cancel_capture_preparation_for_shutdown(
+            unique_id, expected_token, can_launch, require_exact_token);
+        }, [&]() {
+          return session_lifecycle_sync().capture_owner.load() == expected_capture_owner;
+        })) {
+      result.snapshot.stop_in_progress = _session_lifecycle_gate->stop_in_progress();
+      result.snapshot.outcome = result.snapshot.stop_in_progress ?
+        session_stop_outcome_t::stop_in_progress : session_stop_outcome_t::session_changed;
       return result;
     }
     bool stop_committed = false;
-    auto release_stop = util::fail_guard([this, &stop_committed]() {
+    auto release_stop = util::fail_guard([this, &stop_committed, &pending_cancel]() {
+      pending_cancel.reset();
       _session_lifecycle_gate->finish_stop(stop_committed);
     });
 
@@ -10579,6 +10854,7 @@ namespace proc {
     }
 
     stop_committed = true;
+    pending_cancel.reset();
     _session_lifecycle_gate->finish_stop(stop_committed);
     release_stop.disable();
     return result;
@@ -10631,7 +10907,8 @@ namespace proc {
     throw std::out_of_range("Missing closing bracket \')\'");
   }
 
-  std::string parse_env_val(boost::process::v1::native_environment &env, const std::string_view &val_raw) {
+  template<class Environment>
+  std::string parse_env_val(Environment &env, const std::string_view &val_raw) {
     auto pos = std::begin(val_raw);
     auto dollar = std::find(pos, std::end(val_raw), '$');
 
@@ -11510,8 +11787,17 @@ namespace proc {
 
   std::optional<proc::proc_t> parse(const std::string &file_name) {
 
-    // Prepare environment variables.
-    auto this_env = boost::this_process::environment();
+    // Linux's native Boost environment writes to the host. Copy it while
+    // serialized with platform writers; app expansion then uses owned strings.
+    auto current_environment = [] {
+#ifdef __linux__
+      std::lock_guard lock(process_environment::mutex);
+      return boost::process::v1::environment {boost::this_process::environment()};
+#else
+      return boost::this_process::environment();
+#endif
+    };
+    auto this_env = current_environment();
 
     std::set<std::string> ids;
     std::vector<proc::ctx_t> apps;
@@ -11533,9 +11819,19 @@ namespace proc {
         migrate(tree, file_name);
 
         if (tree.contains("env") && tree["env"].is_object()) {
+#ifdef __linux__
+          std::lock_guard lock(process_environment::mutex);
+          auto native_environment = boost::this_process::environment();
+#else
+          auto &native_environment = this_env;
+#endif
+          // Preserve apps.json's host environment updates and ordered expansion.
           for (auto &item : tree["env"].items()) {
-            this_env[item.key()] = parse_env_val(this_env, item.value().get<std::string>());
+            native_environment[item.key()] = parse_env_val(native_environment, item.value().get<std::string>());
           }
+#ifdef __linux__
+          this_env = boost::process::v1::environment {native_environment};
+#endif
         }
 
         // Ensure the "apps" array exists.
@@ -11704,7 +12000,7 @@ namespace proc {
           break;
         }
 
-        this_env = boost::this_process::environment();
+        this_env = current_environment();
         ids.clear();
         apps.clear();
         i = 0;

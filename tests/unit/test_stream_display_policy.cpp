@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <vector>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -106,6 +107,13 @@ namespace {
     std::string output_name;
   };
 
+  /** A remembered host default is process-wide; never let one leak out of a test. */
+  struct HeldHostDefaultGuard {
+    ~HeldHostDefaultGuard() {
+      stream_display_policy::forget_host_default();
+    }
+  };
+
   void configure_headless_cage(bool prefer_gpu_native_capture) {
     config::video.linux_display.headless_mode = true;
     config::video.linux_display.use_cage_compositor = true;
@@ -114,6 +122,170 @@ namespace {
     config::video.linux_display.private_runtime = "labwc";
   }
 }  // namespace
+
+TEST(StreamDisplayPolicyTests, APrivateHostIsNeverMovedOffItsOwnTopologyWithoutBeingAsked) {
+  // The class of bug this catches: a host configured to provide its own private
+  // display gets silently resolved onto some other topology, and the operator
+  // has no way to tell that from a choice they made. It shipped once already,
+  // as an app's stored virtual-display flag outranking the host, and the cost
+  // was an EVDI path at 16.7 fps that nobody selected.
+  //
+  // The invariant, over every registered path and every combination of the
+  // resolver's inputs: on a private host the answer must either defer to the
+  // host default, or be something the caller explicitly named. Enumerating
+  // stream_path::registry() means a path added later is covered on the day it
+  // is added, without anyone remembering to extend this test.
+  using stream_display_policy::effective_session_selection_for_launch;
+
+  std::vector<std::string> candidates {""};
+  for (const auto &descriptor : stream_path::registry()) {
+    candidates.emplace_back(descriptor.id);
+  }
+  ASSERT_GT(candidates.size(), 1u) << "the path registry is empty, so this gate proves nothing";
+
+  size_t checked = 0;
+  for (const auto &requested : candidates) {
+    for (int bits = 0; bits < 32; ++bits) {
+      const bool mirror_desktop = bits & 1;
+      const bool launch_virtual_display = bits & 2;
+      const bool app_virtual_display = bits & 4;
+      const bool user_locked = bits & 8;
+      const bool optimization_present = bits & 16;
+
+      const auto selection = effective_session_selection_for_launch(
+        requested,
+        mirror_desktop,
+        launch_virtual_display,
+        app_virtual_display,
+        user_locked,
+        optimization_present,
+        true  // the host already provides a private display
+      );
+      ++checked;
+
+      const bool deferred_to_the_host = selection.empty();
+      const bool the_caller_named_it = !requested.empty() && selection == requested;
+      const bool mirroring_won = mirror_desktop &&
+        selection == stream_display_policy::k_desktop_display;
+      const bool a_locked_choice_won = user_locked && launch_virtual_display &&
+        selection == stream_display_policy::k_host_virtual_display;
+
+      EXPECT_TRUE(deferred_to_the_host || the_caller_named_it || mirroring_won || a_locked_choice_won)
+        << "a private host was moved to [" << selection << "] with nothing asking for it: "
+        << "requested=[" << requested << "] mirror=" << mirror_desktop
+        << " launch_vd=" << launch_virtual_display
+        << " app_vd=" << app_virtual_display
+        << " locked=" << user_locked
+        << " optimization=" << optimization_present;
+    }
+  }
+  EXPECT_EQ(checked, candidates.size() * 32);
+}
+
+TEST(StreamDisplayPolicyTests, APrivateHostRefusesAnUnlockedVirtualDisplayPreference) {
+  using stream_display_policy::effective_session_selection_for_launch;
+
+  // A headless labwc host creates the session's output itself. An app's stored
+  // virtual-display default, or a client toggle that never locked topology, has
+  // nothing to add and would trade a GPU-native path for an EVDI one.
+  EXPECT_EQ(
+    effective_session_selection_for_launch("", false, false, true, false, false, true),
+    ""
+  ) << "an app's stored default must not drag a private host onto a virtual display";
+  EXPECT_EQ(
+    effective_session_selection_for_launch("", false, true, false, false, false, true),
+    ""
+  ) << "nor may a client toggle that did not lock topology";
+
+  // A deliberate choice still wins, so the mode stays reachable on this host.
+  EXPECT_EQ(
+    effective_session_selection_for_launch("", false, true, false, true, false, true),
+    "host_virtual_display"
+  ) << "a locked client choice, including the paired always-virtual default, is honored";
+  EXPECT_EQ(
+    effective_session_selection_for_launch("host_virtual_display", false, false, true, false, false, true),
+    "host_virtual_display"
+  ) << "an explicit accepted streamMode is honored on a private host";
+  EXPECT_EQ(
+    effective_session_selection_for_launch("headless_stream", false, false, true, false, false, true),
+    "headless_stream"
+  ) << "and an explicit private streamMode is no longer overridden by the app default";
+
+  // Desktop mirroring still outranks everything.
+  EXPECT_EQ(
+    effective_session_selection_for_launch("", true, true, true, false, false, true),
+    "desktop_display"
+  ) << "mirrorDesktop stays authoritative";
+
+  // Without the host answer, every one of those keeps its old meaning.
+  EXPECT_EQ(
+    effective_session_selection_for_launch("", false, false, true, false, false, false),
+    "host_virtual_display"
+  ) << "a host that does not provide the display still takes the app default";
+}
+
+TEST(StreamDisplayPolicyTests, PrivateHostAnswerReadsTheHostNotTheParkedSession) {
+  LinuxDisplayPolicyGuard guard;
+  HeldHostDefaultGuard held;
+  configure_headless_cage(true);
+
+  EXPECT_TRUE(stream_display_policy::host_default_provides_private_display());
+
+  // Park a virtual-display session on it, exactly as a launch override does.
+  stream_display_policy::remember_host_default(
+    stream_display_policy::legacy_booleans_t {true, true, true},
+    "",
+    "wlr"
+  );
+  config::video.linux_display.stream_mode =
+    std::string {stream_display_policy::k_host_virtual_display};
+  config::video.linux_display.use_cage_compositor = false;
+  config::video.capture = "portal";
+
+  EXPECT_TRUE(stream_display_policy::host_default_provides_private_display())
+    << "a session parked on a virtual display does not stop the host being a private host";
+}
+
+TEST(StreamDisplayPolicyTests, HostDefaultOutlivesASessionScopedVirtualDisplayOverride) {
+  LinuxDisplayPolicyGuard guard;
+  HeldHostDefaultGuard held;
+  configure_headless_cage(true);
+
+  // What this host is, before any client launches anything on it.
+  ASSERT_EQ(stream_display_policy::configured_selection(), "windowed_stream");
+
+  // A launch takes the virtual display path. apply_selection rewrites the live
+  // config in place and normalize_host_virtual_display_state_for_backend
+  // replaces the capture backend, and a paused session keeps both rewritten
+  // until its resume window closes. Reproduce that state exactly.
+  stream_display_policy::remember_host_default(
+    stream_display_policy::legacy_booleans_t {true, true, true},
+    "",
+    "wlr"
+  );
+  config::video.linux_display.stream_mode =
+    std::string {stream_display_policy::k_host_virtual_display};
+  config::video.linux_display.use_cage_compositor = false;
+  config::video.capture = "portal";
+
+  EXPECT_EQ(stream_display_policy::configured_selection(), "host_virtual_display")
+    << "the live config is the running session's topology while the override stands";
+  EXPECT_EQ(stream_display_policy::host_default_selection(), "windowed_stream")
+    << "the host default must not become whatever the last client asked for";
+
+  const auto host_default = stream_display_policy::resolve_host_default(
+    stream_display_policy::input_t {}
+  );
+  EXPECT_TRUE(host_default.uses_labwc());
+  EXPECT_TRUE(host_default.requested_headless);
+  EXPECT_FALSE(stream_display_policy::resolve(stream_display_policy::input_t {}).uses_labwc())
+    << "the session's own resolution still follows the live override";
+
+  // Teardown retires the override, and the two answers agree again.
+  stream_display_policy::forget_host_default();
+  EXPECT_EQ(stream_display_policy::host_default_selection(), "host_virtual_display")
+    << "with nothing held, the host default is simply the live configuration";
+}
 
 TEST(StreamDisplayPolicyTests, GpuNativePreferenceLabelsPrivateStreamCaptureCapability) {
   LinuxDisplayPolicyGuard guard;

@@ -444,7 +444,10 @@ endif()
 set(LIBEVDEV_CUSTOM_INCLUDE_DIR "${EVDEV_INCLUDE_DIR}")
 set(LIBEVDEV_CUSTOM_LIBRARY "${EVDEV_LIBRARY}")
 
-add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/inputtino")
+include("${CMAKE_SOURCE_DIR}/cmake/dependencies/inputtino.cmake")
+set(POLARIS_INPUTTINO_SOURCE_DIR "${CMAKE_BINARY_DIR}/dependencies/inputtino-source")
+polaris_prepare_inputtino("${CMAKE_SOURCE_DIR}/third-party/inputtino" "${POLARIS_INPUTTINO_SOURCE_DIR}")
+add_subdirectory("${POLARIS_INPUTTINO_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/dependencies/inputtino-build")
 set_target_properties(libinputtino PROPERTIES
         CXX_STANDARD 23
         CXX_STANDARD_REQUIRED ON)
@@ -513,6 +516,8 @@ list(APPEND PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_authority.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_client.h"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_client.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_media_pump.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_media_pump.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_launch_authority.h"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_coordinator.h"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_coordinator.cpp"

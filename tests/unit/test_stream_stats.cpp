@@ -7,6 +7,9 @@
 #include <src/config.h>
 #include <src/doctor_actions.h>
 #include <src/adaptive_bitrate.h>
+#include <src/private_state_file.h>
+#include <src/utility.h>
+#include "../tests_events.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -27,6 +30,7 @@ namespace {
   struct LinuxDisplayConfigGuard {
     LinuxDisplayConfigGuard():
         adapter_name {config::video.adapter_name},
+        capture {config::video.capture},
         encoder {config::video.encoder},
         headless_mode {config::video.linux_display.headless_mode},
         use_cage_compositor {config::video.linux_display.use_cage_compositor},
@@ -35,6 +39,7 @@ namespace {
 
     ~LinuxDisplayConfigGuard() {
       config::video.adapter_name = adapter_name;
+      config::video.capture = capture;
       config::video.encoder = encoder;
       config::video.linux_display.headless_mode = headless_mode;
       config::video.linux_display.use_cage_compositor = use_cage_compositor;
@@ -42,6 +47,7 @@ namespace {
     }
 
     std::string adapter_name;
+    std::string capture;
     std::string encoder;
     bool headless_mode;
     bool use_cage_compositor;
@@ -73,6 +79,21 @@ namespace {
     }
 
     std::filesystem::path path;
+  };
+
+  struct LiveConfigurationGuard {
+    std::string old = config::sunshine.config_file;
+    std::filesystem::path directory = std::filesystem::temp_directory_path() /
+      ("polaris-live-config-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    LiveConfigurationGuard() {
+      std::filesystem::create_directory(directory);
+      config::sunshine.config_file = (directory / "polaris.conf").string();
+      (void) private_state_file::write_atomic(config::sunshine.config_file, "adaptive_bitrate_enabled = disabled\n");
+    }
+    ~LiveConfigurationGuard() {
+      config::sunshine.config_file = old;
+      std::filesystem::remove_all(directory);
+    }
   };
 
   void mark_doctor_pacing_window_confirmed(stream_stats::stats_t &stats) {
@@ -230,7 +251,7 @@ TEST(StreamStatsLinuxGpuProfileTests, WarnsWhenNvidiaTrueHeadlessDisablesGpuNati
 }
 
 #if defined(__linux__) && defined(POLARIS_BUILD_VULKAN)
-TEST(StreamStatsLinuxGpuProfileTests, RecommendsAutoVulkanForExplicitAmdVaapiShmPrivateStream) {
+TEST(StreamStatsLinuxGpuProfileTests, PreservesExplicitAmdVaapiCompatibilityChoice) {
   LinuxDisplayConfigGuard guard;
   config::video.encoder = "vaapi";
   config::video.linux_display.use_cage_compositor = true;
@@ -251,9 +272,13 @@ TEST(StreamStatsLinuxGpuProfileTests, RecommendsAutoVulkanForExplicitAmdVaapiShm
   });
 
   ASSERT_NE(recommendation, warnings.end());
-  EXPECT_NE(recommendation->at("action").get<std::string>().find("Autodetect"), std::string::npos);
-  EXPECT_NE(recommendation->at("action").get<std::string>().find("Vulkan Video"), std::string::npos);
-  EXPECT_NE(recommendation->at("action").get<std::string>().find("fall back to VA-API"), std::string::npos);
+  EXPECT_EQ(recommendation->at("severity"), "info");
+  const auto action = recommendation->at("action").get<std::string>();
+  EXPECT_NE(action.find("Keep VA-API selected"), std::string::npos);
+  EXPECT_NE(action.find("reduce resolution, frame rate, or bitrate"), std::string::npos);
+  EXPECT_EQ(action.find("Autodetect"), std::string::npos);
+  EXPECT_EQ(action.find("will live-probe"), std::string::npos);
+  EXPECT_EQ(config::video.encoder, "vaapi");
 }
 #endif
 
@@ -858,6 +883,219 @@ TEST(StreamStatsFecProtectionTests, RoutesEvidenceBySessionGeneration) {
     stream_stats::get_current().fec_protection.oversized_frames_total,
     0
   );
+}
+
+TEST(StreamStatsDoctorTests, ReportsAHostWithNoCaptureBackendAsFailed) {
+  // Polaris logs this fatally at startup and then serves anyway, so the host pairs, accepts
+  // launches and advertises H.264 as the only codec it has while Doctor reads clean. See #677.
+  platf::set_capture_sources_missing_for_tests(true);
+
+  stream_stats::stats_t stats {};
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  bool saw_warning = false;
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    if (warning.at("id") != "no_capture_backend") {
+      continue;
+    }
+    saw_warning = true;
+    EXPECT_EQ(warning.at("severity"), "fail");
+    EXPECT_NE(warning.at("message").get<std::string>().find("H.264"), std::string::npos);
+  }
+  EXPECT_TRUE(saw_warning);
+
+  platf::set_capture_sources_missing_for_tests(false);
+}
+
+TEST(StreamStatsDoctorTests, SaysNothingAboutCaptureBeforeAnythingHasBeenEvaluated) {
+  // The accessor must not report a problem it has never looked for: Doctor is asked for a report
+  // before startup has finished, and an empty source set then means "not yet", not "broken".
+  platf::set_capture_sources_missing_for_tests(false);
+
+  stream_stats::stats_t stats {};
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    EXPECT_NE(warning.at("id"), "no_capture_backend");
+  }
+}
+
+TEST(StreamStatsDoctorTests, ReportsACaptureBackendThatWasSubstituted) {
+  // Before this, the only trace of a substituted capture backend was one warning in the middle of
+  // startup, while the host went on serving with a backend nobody chose. See #677.
+  platf::set_capture_backend_substitution_for_tests("wlr -> portal");
+
+  stream_stats::stats_t stats {};
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  bool saw_warning = false;
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    if (warning.at("id") != "capture_backend_substituted") {
+      continue;
+    }
+    saw_warning = true;
+    EXPECT_EQ(warning.at("severity"), "warning");
+    EXPECT_NE(warning.at("message").get<std::string>().find("wlr -> portal"), std::string::npos);
+  }
+  EXPECT_TRUE(saw_warning);
+
+  platf::set_capture_backend_substitution_for_tests("");
+}
+
+TEST(StreamStatsDoctorTests, SaysNothingWhenTheConfiguredCaptureBackendWasUsed) {
+  platf::set_capture_backend_substitution_for_tests("");
+
+  stream_stats::stats_t stats {};
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    EXPECT_NE(warning.at("id"), "capture_backend_substituted");
+  }
+}
+
+TEST(StreamStatsDoctorTests, NamesTheCapturePathWhenHdrWasAskedForAndNotDelivered) {
+  // The host already knew why and only ever said so over the session-status route, while a
+  // stream was live. A person who ticks "request HDR", sees SDR and goes looking for a reason
+  // is standing in front of the console with nothing streaming.
+  LinuxDisplayConfigGuard guard;
+  config::video.capture = "wlr";
+  config::video.linux_display.use_cage_compositor = true;
+
+  stream_stats::stats_t stats {};
+  stats.dynamic_range = 1;
+  stats.runtime_effective_headless = true;
+  stats.display_hdr = false;
+  stats.hdr_metadata_available = false;
+  stats.stream_hdr_enabled = false;
+
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  bool saw_hdr_evidence = false;
+  for (const auto &entry : doctor.at("evidence")) {
+    if (entry.at("id") != "hdr") {
+      continue;
+    }
+    saw_hdr_evidence = true;
+    EXPECT_EQ(entry.at("status"), "watch");
+    EXPECT_EQ(entry.at("value"), "sdr_10bit");
+    EXPECT_NE(entry.at("detail").get<std::string>().find("10-bit SDR, not HDR"), std::string::npos);
+  }
+  EXPECT_TRUE(saw_hdr_evidence);
+
+  bool saw_warning = false;
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    if (warning.at("id") != "hdr_capture_path_cannot_report_hdr") {
+      continue;
+    }
+    saw_warning = true;
+    EXPECT_EQ(warning.at("severity"), "info");
+    // The wlroots path never overrides is_hdr(), so this is permanent, not a bad moment.
+    EXPECT_NE(warning.at("message").get<std::string>().find("wlroots"), std::string::npos);
+    EXPECT_NE(warning.at("action").get<std::string>().find("KMS/DRM"), std::string::npos);
+  }
+  EXPECT_TRUE(saw_warning);
+}
+
+TEST(StreamStatsDoctorTests, HdrEvidenceStaysInformationalWhenNobodyAskedForHdr) {
+  // Most hosts never ask for HDR. The row still reports, but it must not nag, and it must not
+  // accuse a capture path of failing at something nobody requested.
+  LinuxDisplayConfigGuard guard;
+  config::video.capture = "wlr";
+  config::video.linux_display.use_cage_compositor = true;
+
+  stream_stats::stats_t stats {};
+  stats.dynamic_range = 0;
+
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  bool saw_hdr_evidence = false;
+  for (const auto &entry : doctor.at("evidence")) {
+    if (entry.at("id") != "hdr") {
+      continue;
+    }
+    saw_hdr_evidence = true;
+    EXPECT_EQ(entry.at("status"), "info");
+    EXPECT_EQ(entry.at("value"), "sdr_8bit");
+  }
+  EXPECT_TRUE(saw_hdr_evidence);
+
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    EXPECT_NE(warning.at("id"), "hdr_capture_path_cannot_report_hdr");
+  }
+}
+
+TEST(StreamStatsDoctorTests, NamesTheSavedSettingThatSwitchedHdrOff) {
+  // This is the shape that leaves someone with nothing to go on. A saved setting stops HDR being
+  // requested at all, so dynamic_range never leaves zero, hdr_downgrade_reason answers "none",
+  // and every capability-based check stays quiet while the user re-toggles a client switch that
+  // was never the problem. It has to speak without a request having been made.
+  LinuxDisplayConfigGuard guard;
+
+  stream_stats::stats_t stats {};
+  stats.dynamic_range = 0;
+  stats.hdr_policy_hdr = false;
+  stats.hdr_policy_reason = "paired_device_hdr_unsupported";
+  stats.hdr_policy_device = "RetroidPocket6";
+
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  bool saw_warning = false;
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    if (warning.at("id") != "hdr_disabled_by_saved_setting") {
+      continue;
+    }
+    saw_warning = true;
+    const auto message = warning.at("message").get<std::string>();
+    EXPECT_NE(message.find("device_db.json"), std::string::npos);
+    EXPECT_NE(message.find("RetroidPocket6"), std::string::npos);
+    EXPECT_NE(warning.at("action").get<std::string>().find("hdr_capable"), std::string::npos);
+  }
+  EXPECT_TRUE(saw_warning);
+}
+
+TEST(StreamStatsDoctorTests, SaysNothingAboutSavedSettingsWhenHdrWasAllowed) {
+  LinuxDisplayConfigGuard guard;
+
+  stream_stats::stats_t stats {};
+  stats.hdr_policy_hdr = true;
+  stats.hdr_policy_reason = "requested_hdr_setting";
+  stats.hdr_policy_device = "RetroidPocket6";
+
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    EXPECT_NE(warning.at("id"), "hdr_disabled_by_saved_setting");
+  }
+}
+
+TEST(StreamStatsDoctorTests, HdrVerdictSurvivesTheEndOfTheStream) {
+  // Same reasoning as the Steam Input finding above: the answer describes the host's capture
+  // path, and the person asking the question has already disconnected.
+  stream_stats::update_stream_active(true, "client", "10.0.0.5");
+  stream_stats::update_dynamic_range(1);
+  stream_stats::update_hdr_state(false, false, false, "SDR (Rec. 709)");
+  stream_stats::update_hdr_policy(false, "paired_device_hdr_unsupported", "RetroidPocket6");
+
+  stream_stats::update_stream_active(false, "", "");
+
+  const auto after = stream_stats::get_current();
+  EXPECT_FALSE(after.streaming);
+  EXPECT_EQ(after.dynamic_range, 1);
+  EXPECT_FALSE(after.stream_hdr_enabled);
+  EXPECT_EQ(stream_stats::hdr_effective_mode(after), "sdr_10bit");
+  EXPECT_NE(stream_stats::hdr_downgrade_reason(after), "none");
+  EXPECT_EQ(after.hdr_policy_reason, "paired_device_hdr_unsupported");
+  EXPECT_EQ(after.hdr_policy_device, "RetroidPocket6");
+
+  stream_stats::update_stream_active(false, "", "");
 }
 
 TEST(StreamStatsDoctorTests, SteamInputFindingSurvivesTheEndOfTheStream) {
@@ -2617,6 +2855,7 @@ TEST(DoctorActionTests, OlderStreamCannotAutoFixAfterTheNewestViewerLeaves) {
 }
 
 TEST(DoctorActionTests, IdempotentAutoFixCannotOverwriteANewerOwnerBitrate) {
+  LiveConfigurationGuard live_configuration;
   config::video.adaptive_bitrate.enabled = false;
   config::video.adaptive_bitrate.min_bitrate_kbps = 2000;
   config::video.adaptive_bitrate.max_bitrate_kbps = 100000;
@@ -2702,6 +2941,7 @@ TEST(DoctorActionTests, IdempotentAutoFixCannotOverwriteANewerOwnerBitrate) {
 }
 
 TEST(DoctorActionTests, StaleControllerRevisionCannotOverrideANewerOwnerChoice) {
+  LiveConfigurationGuard live_configuration;
   config::video.adaptive_bitrate.enabled = false;
   config::video.adaptive_bitrate.min_bitrate_kbps = 2000;
   config::video.adaptive_bitrate.max_bitrate_kbps = 100000;
@@ -2837,7 +3077,27 @@ TEST(DoctorActionTests, EquivalentFreshTelemetryCannotMakeAutoFixUnclickable) {
   stream_stats::update_stream_active(false);
 }
 
+TEST(PolarisEventListenerTests, ReportsExceptionsWithoutASourceLocation) {
+  PolarisEventListener listener;
+  const testing::TestPartResult result(
+    testing::TestPartResult::kFatalFailure, nullptr, -1, "test exception"
+  );
+  listener.OnTestProgramStart(*testing::UnitTest::GetInstance());
+  const auto cleanup = util::fail_guard([&] {
+    listener.OnTestProgramEnd(*testing::UnitTest::GetInstance());
+  });
+  EXPECT_NO_THROW(listener.OnTestPartResult(result));
+  std::string output;
+  {
+    const auto backend = listener.sink->locked_backend();
+    output = listener.sink_buffer->str();
+  }
+  EXPECT_NE(output.find("<unknown file>"), std::string::npos);
+  EXPECT_NE(output.find("test exception"), std::string::npos);
+}
+
 TEST(DoctorActionTests, EveryRequestIdRemainsIdempotentForTheWholeStreamGeneration) {
+  LiveConfigurationGuard live_configuration;
   config::video.adaptive_bitrate.enabled = false;
   config::video.adaptive_bitrate.min_bitrate_kbps = 2000;
   config::video.adaptive_bitrate.max_bitrate_kbps = 100000;
@@ -2856,6 +3116,11 @@ TEST(DoctorActionTests, EveryRequestIdRemainsIdempotentForTheWholeStreamGenerati
   doctor_actions::session_started("client-owner", generation, "launch-423", 20000);
   adaptive_bitrate::set_runtime_update_supported(true, {}, 20000);
   stream_stats::start_session_timing("client-owner", generation, "launch-423");
+  const auto cleanup = util::fail_guard([&] {
+    doctor_actions::session_ended("client-owner", generation);
+    stream_stats::stop_session_timing("client-owner", generation);
+    stream_stats::update_stream_active(false);
+  });
 
   doctor_actions::recovery_action_context_t context;
   context.active_owner = true;
@@ -2868,27 +3133,40 @@ TEST(DoctorActionTests, EveryRequestIdRemainsIdempotentForTheWholeStreamGenerati
 
   nlohmann::json first_request;
   for (int i = 0; i < 128; ++i) {
+    // Owner updates persist configuration. A slow filesystem must not age the
+    // synthetic observation out while this test fills the receipt history.
+    stream_stats::update_network_stats(52.0, 3.4, 1000);
     context.stats = stream_stats::get_current();
     const auto request = trusted_doctor_action_request(context);
+    ASSERT_EQ(request.value("action_id", ""), "lower_bitrate") << request.dump();
     if (i == 0) first_request = request;
     const auto applied = doctor_actions::execute(request, context);
-    ASSERT_TRUE(applied.at("status").get<bool>());
+    ASSERT_TRUE(applied.at("status").get<bool>()) << applied.dump();
     ASSERT_EQ(applied.at("state"), "applying");
     ASSERT_TRUE(doctor_actions::set_owner_live_bitrate(
       "client-owner", generation, "launch-423", 20000
     ));
   }
 
+  // Capacity and retained idempotency receipts do not depend on live telemetry.
+  // Reuse an admitted action envelope with a new ID rather than deriving an
+  // action from expired evidence, which correctly offers no new live fix.
+  stream_stats::age_latest_network_observation_for_tests(std::chrono::seconds(3));
   context.stats = stream_stats::get_current();
+  ASSERT_GE(context.stats.network_last_received_age_ms, 2000);
+  ASSERT_GE(context.stats.media_loss_last_received_age_ms, 2000);
+  auto capacity_request = first_request;
+  capacity_request["request_id"] = "test-doctor-request-over-capacity";
   const auto over_capacity = doctor_actions::execute(
-    trusted_doctor_action_request(context), context
+    capacity_request, context
   );
-  EXPECT_FALSE(over_capacity.at("status").get<bool>());
+  ASSERT_FALSE(over_capacity.at("status").get<bool>()) << over_capacity.dump();
+  ASSERT_TRUE(over_capacity.contains("state")) << over_capacity.dump();
   EXPECT_EQ(over_capacity.at("state"), "generation_action_limit");
   EXPECT_EQ(over_capacity.at("code"), "doctor_idempotency_capacity_reached");
 
   const auto oldest_retry = doctor_actions::execute(first_request, context);
-  EXPECT_TRUE(oldest_retry.at("status").get<bool>());
+  ASSERT_TRUE(oldest_retry.at("status").get<bool>()) << oldest_retry.dump();
   EXPECT_FALSE(oldest_retry.at("changed").get<bool>());
   EXPECT_EQ(oldest_retry.at("state"), "superseded");
   EXPECT_EQ(
@@ -2897,9 +3175,6 @@ TEST(DoctorActionTests, EveryRequestIdRemainsIdempotentForTheWholeStreamGenerati
   );
   EXPECT_EQ(adaptive_bitrate::get_doctor_state().live_bitrate_kbps, 20000);
 
-  doctor_actions::session_ended("client-owner", generation);
-  stream_stats::stop_session_timing("client-owner", generation);
-  stream_stats::update_stream_active(false);
 }
 
 TEST(DoctorActionTests, AdaptiveToggleRestoresDoctorTargetBeforeChangingPolicy) {

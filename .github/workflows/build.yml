@@ -45,6 +45,9 @@ jobs:
       - name: Verify Bazzite validation receipt gate
         run: python3 scripts/validation/bazzite/test_validate_receipt.py
 
+      - name: Verify private sysext input and assembly boundaries
+        run: python3 -m unittest discover -s scripts/packaging/sysext -p 'test_*.py'
+
       - name: Bind release tag to source commit
         id: source
         env:
@@ -167,6 +170,7 @@ jobs:
         run: |
           snapshot_sources="$RUNNER_TEMP/polaris-ubuntu-snapshot.sources"
           snapshot_source_parts="$RUNNER_TEMP/polaris-ubuntu-source-parts"
+          snapshot_preferences="$RUNNER_TEMP/polaris-ubuntu-snapshot.pref"
           snapshot_lists="$RUNNER_TEMP/polaris-ubuntu-lists"
           snapshot_archives="/var/tmp/polaris-ubuntu-archives"
           mkdir -p "$snapshot_source_parts" "$snapshot_lists/partial" "$snapshot_archives/partial"
@@ -178,9 +182,19 @@ jobs:
           Components: main universe restricted multiverse
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
+          # A hosted runner may already carry libraries newer than this snapshot.
+          # Prefer the pinned dependency closure, including required downgrades,
+          # without changing the runner's persistent APT configuration.
+          cat > "$snapshot_preferences" <<EOF
+          Package: *
+          Pin: origin "snapshot.ubuntu.com"
+          Pin-Priority: 1001
+          EOF
           apt_options=(
             -o "Dir::Etc::sourcelist=$snapshot_sources"
             -o "Dir::Etc::sourceparts=$snapshot_source_parts"
+            -o "Dir::Etc::preferences=$snapshot_preferences"
+            -o "Dir::Etc::preferencesparts=$snapshot_source_parts"
             -o "Dir::State::Lists=$snapshot_lists"
             -o "Dir::Cache::archives=$snapshot_archives"
             -o APT::Update::Error-Mode=any
@@ -200,13 +214,14 @@ jobs:
             libpulse-dev libopus-dev \
             "libcurl4t64=$curl_snapshot_version" "libcurl4-openssl-dev=$curl_snapshot_version" \
             libdrm-dev libgbm-dev libcap-dev libwayland-dev \
-            libpipewire-0.3-dev libx11-dev libxrandr-dev \
+            libpipewire-0.3-dev pipewire-bin libx11-dev libxrandr-dev \
             libxfixes-dev libxi-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev \
             libva-dev libminiupnpc-dev libnotify-dev nlohmann-json3-dev \
             libappindicator3-dev libgtk-3-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             glslang-tools libvulkan-dev \
             wayland-protocols
+          test -r /usr/share/pipewire/client.conf
           sudo chmod -R a+rX "$snapshot_archives"
 
       - name: Configure sanitizer build
@@ -225,7 +240,7 @@ jobs:
       - name: Build sanitizer unit tests
         run: |
           cmake --build build-sanitize --target \
-            test_polaris test_polaris_audio test_polaris_audit test_polaris_config \
+            test_inputtino_phys test_inputtino_device test_inputtino_reports test_multiseat_runtime test_polaris test_polaris_audio test_polaris_audit test_polaris_config \
             test_polaris_http test_polaris_input test_polaris_network test_polaris_pairing \
             test_polaris_platform test_polaris_steam_shutdown test_polaris_stream test_polaris_video \
             -j"$(nproc)"
@@ -236,7 +251,7 @@ jobs:
         # executable in both this build list and the anchored ctest expression;
         # narrow deliberately only if a suite earns it.
         run: |
-          ctest --test-dir build-sanitize/tests --output-on-failure -R '^(test_polaris|test_polaris_audio|test_polaris_audit|test_polaris_config|test_polaris_http|test_polaris_input|test_polaris_network|test_polaris_pairing|test_polaris_platform|test_polaris_steam_shutdown|test_polaris_stream|test_polaris_video|polaris_gamescope_runtime_shell|polaris_gamescope_session_stop_shell|polaris_gamescope_session_geometry_shell|polaris_gamescope_primary_child_shell)$'
+          ctest --test-dir build-sanitize/tests --output-on-failure -R '^(test_inputtino_phys|test_inputtino_device|test_inputtino_reports|test_multiseat_runtime|test_polaris|test_polaris_audio|test_polaris_audit|test_polaris_config|test_polaris_http|test_polaris_input|test_polaris_network|test_polaris_pairing|test_polaris_platform|test_polaris_steam_shutdown|test_polaris_stream|test_polaris_video|polaris_gamescope_runtime_shell|polaris_gamescope_session_stop_shell|polaris_gamescope_session_geometry_shell|polaris_gamescope_primary_child_shell)$'
 
   arch-build:
     name: Arch build
@@ -247,6 +262,8 @@ jobs:
       # Keep the base immutable. The repository snapshot and hash-pinned Boost
       # overlay below define the complete package userspace used by the build.
       image: archlinux@sha256:4bf33b21a715aac0b48ce6e9eaed4782a898eae96f88f5da3635572129c2584a
+      # Worker launches also use --init to reap orphaned provider descendants.
+      options: --init
     env:
       ARCH_REPOSITORY_SNAPSHOT: 2026/08/19
       ARCH_BOOST_PACKAGE_VERSION: 1.92.0-1
@@ -325,7 +342,7 @@ jobs:
             gcc go libdrm libevdev libmfx libnotify libpulse libva libx11 libxcb \
             libxfixes libxi libxrandr libxtst mesa miniupnpc ninja nodejs \
             nlohmann-json npm numactl openssl opus pipewire python shaderc vulkan-headers vulkan-icd-loader \
-            wayland wayland-protocols which
+            util-linux wayland wayland-protocols which
 
       - name: Install pinned Boost ABI
         run: |
@@ -351,6 +368,7 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DBUILD_TESTS=ON \
+            -DBUILD_FULL_TESTS=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -379,6 +397,37 @@ jobs:
       - name: Run fast C++ tests
         if: ${{ !(startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != '') }}
         run: ctest --test-dir build/tests --output-on-failure -R '^test_polaris$'
+
+      - name: Run multiseat runtime, stream and Go interop tests
+        if: ${{ !(startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != '') }}
+        # The pinned Arch snapshot supplies a Go version new enough to build
+        # the C++/Go interop fixture. Require all suites so a missing fixture
+        # cannot silently reduce this gate to host-only coverage.
+        run: |
+          set -euo pipefail
+          # The worker authority intentionally refuses root. This container
+          # builds as root, so exercise admission with an ordinary service UID.
+          # A private TMPDIR also avoids the preceding root suite's temp files.
+          test_root="$(mktemp -d /tmp/polaris-ci.XXXXXX)"
+          trap 'rm -rf -- "$test_root"' EXIT
+          useradd --user-group --no-create-home --home-dir "$test_root/home" polaris-tests
+          install -d -m 700 -o polaris-tests -g polaris-tests \
+            "$test_root" "$test_root/home" "$test_root/tmp" "$test_root/runtime" \
+            "$test_root/config" "$test_root/cache" "$test_root/go-cache"
+          chown -hR polaris-tests:polaris-tests build/tests
+          test "$(runuser -u polaris-tests -- id -u)" -ne 0
+          run_test_suite() {
+            runuser -u polaris-tests -- env -i \
+              PATH=/usr/local/bin:/usr/bin USER=polaris-tests LOGNAME=polaris-tests \
+              HOME="$test_root/home" TMPDIR="$test_root/tmp" \
+              XDG_RUNTIME_DIR="$test_root/runtime" XDG_CONFIG_HOME="$test_root/config" \
+              XDG_CACHE_HOME="$test_root/cache" GOCACHE="$test_root/go-cache" \
+              ctest --test-dir "$GITHUB_WORKSPACE/build/tests" \
+                --output-on-failure --no-tests=error -R "$1"
+          }
+          run_test_suite '^test_multiseat_runtime$'
+          run_test_suite '^test_polaris_stream$'
+          run_test_suite '^polaris_multiseat_worker_go$'
 
       - name: Generate Arch package files
         run: |
@@ -902,6 +951,7 @@ jobs:
         run: |
           snapshot_sources="$RUNNER_TEMP/polaris-ubuntu-snapshot.sources"
           snapshot_source_parts="$RUNNER_TEMP/polaris-ubuntu-source-parts"
+          snapshot_preferences="$RUNNER_TEMP/polaris-ubuntu-snapshot.pref"
           snapshot_lists="$RUNNER_TEMP/polaris-ubuntu-lists"
           snapshot_archives="/var/tmp/polaris-ubuntu-archives"
           mkdir -p "$snapshot_source_parts" "$snapshot_lists/partial" "$snapshot_archives/partial"
@@ -913,9 +963,19 @@ jobs:
           Components: main universe restricted multiverse
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
+          # A hosted runner may already carry libraries newer than this snapshot.
+          # Prefer the pinned dependency closure, including required downgrades,
+          # without changing the runner's persistent APT configuration.
+          cat > "$snapshot_preferences" <<EOF
+          Package: *
+          Pin: origin "snapshot.ubuntu.com"
+          Pin-Priority: 1001
+          EOF
           apt_options=(
             -o "Dir::Etc::sourcelist=$snapshot_sources"
             -o "Dir::Etc::sourceparts=$snapshot_source_parts"
+            -o "Dir::Etc::preferences=$snapshot_preferences"
+            -o "Dir::Etc::preferencesparts=$snapshot_source_parts"
             -o "Dir::State::Lists=$snapshot_lists"
             -o "Dir::Cache::archives=$snapshot_archives"
             -o APT::Update::Error-Mode=any
@@ -935,7 +995,7 @@ jobs:
             libpulse-dev libopus-dev \
             "libcurl4t64=$curl_snapshot_version" "libcurl4-openssl-dev=$curl_snapshot_version" \
             libdrm-dev libgbm-dev libcap-dev libwayland-dev \
-            libpipewire-0.3-dev libx11-dev libxrandr-dev \
+            libpipewire-0.3-dev pipewire-bin libx11-dev libxrandr-dev \
             libxfixes-dev libxi-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev \
             libva-dev libminiupnpc-dev libnotify-dev nlohmann-json3-dev \
             libappindicator3-dev libgtk-3-dev \
@@ -943,6 +1003,7 @@ jobs:
             glslang-tools libvulkan-dev \
             golang-go \
             wayland-protocols
+          test -r /usr/share/pipewire/client.conf
           sudo chmod -R a+rX "$snapshot_archives"
 
       - name: Configure
@@ -1010,6 +1071,7 @@ jobs:
 
           snapshot_sources="$RUNNER_TEMP/polaris-ubuntu-snapshot.sources"
           snapshot_source_parts="$RUNNER_TEMP/polaris-ubuntu-source-parts"
+          snapshot_preferences="$RUNNER_TEMP/polaris-ubuntu-snapshot.pref"
           snapshot_lists="$RUNNER_TEMP/polaris-ubuntu-lists"
           test -s "$snapshot_sources"
           test -d "$snapshot_source_parts"
@@ -1017,6 +1079,8 @@ jobs:
           apt_options=(
             -o "Dir::Etc::sourcelist=$snapshot_sources"
             -o "Dir::Etc::sourceparts=$snapshot_source_parts"
+            -o "Dir::Etc::preferences=$snapshot_preferences"
+            -o "Dir::Etc::preferencesparts=$snapshot_source_parts"
             -o "Dir::State::Lists=$snapshot_lists"
             -o Acquire::Retries=3
             -o Acquire::http::Timeout=30
@@ -1181,6 +1245,17 @@ jobs:
             sleep $((attempt * 10))
           done
           exit 1
+
+      - name: Verify offline sysext RPM transactions
+        run: |
+          dnf install -y rpm-sign gnupg2
+          command -v rpm
+          command -v rpmbuild
+          command -v rpmsign
+          command -v rpm2archive
+          rpm2archive --help | grep -q -- '--format'
+          command -v gpg
+          python3 -m unittest discover -s scripts/packaging/sysext -p 'test_*.py'
 
       - name: Install CUDA toolkit
         if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != '' }}

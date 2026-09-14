@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +27,8 @@ const (
 	// regular executable itself and never follow the packaging symlink.
 	defaultPipeWirePulsePath  = "/usr/bin/pipewire"
 	defaultPWCLIPath          = "/usr/bin/pw-cli"
+	defaultPWDumpPath         = "/usr/bin/pw-dump"
+	defaultWirePlumberPath    = "/usr/bin/wireplumber"
 	defaultPactlPath          = "/usr/bin/pactl"
 	defaultGSTLaunchPath      = "/usr/bin/gst-launch-1.0"
 	defaultGSTInspectPath     = "/usr/bin/gst-inspect-1.0"
@@ -45,6 +48,8 @@ type providerOptions struct {
 	pipeWirePath          string
 	pipeWirePulsePath     string
 	pwCLIPath             string
+	pwDumpPath            string
+	wirePlumberPath       string
 	pactlPath             string
 	gstLaunchPath         string
 	gstInspectPath        string
@@ -56,6 +61,7 @@ type providerOptions struct {
 	x11LockDirectory      string
 	x11DirectoryOwnerUID  uint32
 	x11DirectoryMode      uint32
+	x11LockDirectoryMode  uint32
 	softwareGamescope     bool
 	softwareVulkanICDPath string
 	allowSharedX11        bool
@@ -74,6 +80,8 @@ func defaultProviderOptions() providerOptions {
 		pipeWirePath:         defaultPipeWirePath,
 		pipeWirePulsePath:    defaultPipeWirePulsePath,
 		pwCLIPath:            defaultPWCLIPath,
+		pwDumpPath:           defaultPWDumpPath,
+		wirePlumberPath:      defaultWirePlumberPath,
 		pactlPath:            defaultPactlPath,
 		gstLaunchPath:        defaultGSTLaunchPath,
 		gstInspectPath:       defaultGSTInspectPath,
@@ -96,11 +104,16 @@ func validAbsolutePath(path string) bool {
 }
 
 func normalizeProviderOptions(options providerOptions) (providerOptions, error) {
+	if options.x11LockDirectoryMode == 0 {
+		options.x11LockDirectoryMode = options.x11DirectoryMode
+	}
 	if !validAbsolutePath(options.runtimeDirectory) ||
 		!validAbsolutePath(options.dbusDaemonPath) ||
 		!validAbsolutePath(options.pipeWirePath) ||
 		!validAbsolutePath(options.pipeWirePulsePath) ||
 		!validAbsolutePath(options.pwCLIPath) ||
+		!validAbsolutePath(options.pwDumpPath) ||
+		!validAbsolutePath(options.wirePlumberPath) ||
 		!validAbsolutePath(options.pactlPath) ||
 		!validAbsolutePath(options.gstLaunchPath) ||
 		!validAbsolutePath(options.gstInspectPath) ||
@@ -113,9 +126,9 @@ func normalizeProviderOptions(options providerOptions) (providerOptions, error) 
 		(options.softwareVulkanICDPath != "" &&
 			!validAbsolutePath(options.softwareVulkanICDPath)) ||
 		options.x11DirectoryMode == 0 || options.x11DirectoryMode > 0o7777 ||
+		options.x11LockDirectoryMode > 0o7777 ||
 		(options.softwareGamescope && options.softwareVulkanICDPath == "") ||
-		(!options.softwareGamescope &&
-			(options.softwareVulkanICDPath != "" || options.allowSharedX11)) ||
+		(!options.softwareGamescope && options.softwareVulkanICDPath != "") ||
 		options.startupTimeout <= 0 || options.probeTimeout <= 0 ||
 		options.stopTimeout <= 0 || options.probeInterval <= 0 ||
 		options.probeInterval > options.startupTimeout {
@@ -200,6 +213,7 @@ type runtimeDirectory struct {
 	dev  uint64
 	ino  uint64
 	uid  uint32
+	pins artifactPins
 }
 
 func openRuntimeDirectory(path string, expectedUID uint32) (*runtimeDirectory, error) {
@@ -256,15 +270,84 @@ func (runtime *runtimeDirectory) verify() error {
 
 func (runtime *runtimeDirectory) close() {
 	if runtime != nil && runtime.file != nil {
+		runtime.pins.close()
 		_ = runtime.file.Close()
 	}
 }
 
+// Keep captured inodes allocated through child shutdown and cleanup. Comparing
+// dev/ino alone cannot identify an unlinked inode after the kernel reuses it.
+// O_PATH pins grant no read/write access and never reach a provider child.
+type artifactPins struct {
+	mutex  sync.Mutex
+	files  map[[2]uint64]*os.File
+	closed bool
+}
+
+const maximumArtifactPins = 256
+const linuxOPath = 0x200000
+
+func (pins *artifactPins) capture(path string) (artifactIdentity, error) {
+	pins.mutex.Lock()
+	defer pins.mutex.Unlock()
+	if pins.closed {
+		return artifactIdentity{}, errors.New("runtime artifact ownership is closed")
+	}
+	expected, err := lstatIdentity(path)
+	if err != nil {
+		return artifactIdentity{}, err
+	}
+	if expected.mode&syscall.S_IFMT == syscall.S_IFLNK {
+		return artifactIdentity{}, errors.New("runtime artifact cannot be a symlink")
+	}
+	descriptor, err := syscall.Open(path, linuxOPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return artifactIdentity{}, err
+	}
+	var status syscall.Stat_t
+	if err := syscall.Fstat(descriptor, &status); err != nil || !sameIdentity(expected, artifactIdentity{
+		dev: uint64(status.Dev), ino: status.Ino, mode: status.Mode, uid: status.Uid,
+	}) {
+		_ = syscall.Close(descriptor)
+		return artifactIdentity{}, errors.New("runtime artifact changed while acquiring ownership")
+	}
+	key := [2]uint64{expected.dev, expected.ino}
+	if _, present := pins.files[key]; present {
+		_ = syscall.Close(descriptor)
+		return expected, nil
+	}
+	if len(pins.files) >= maximumArtifactPins {
+		_ = syscall.Close(descriptor)
+		return artifactIdentity{}, errors.New("runtime artifact ownership limit reached")
+	}
+	file := os.NewFile(uintptr(descriptor), "polaris-artifact-pin")
+	if file == nil {
+		_ = syscall.Close(descriptor)
+		return artifactIdentity{}, errors.New("runtime artifact ownership is unavailable")
+	}
+	if pins.files == nil {
+		pins.files = make(map[[2]uint64]*os.File)
+	}
+	pins.files[key] = file
+	return expected, nil
+}
+
+func (pins *artifactPins) close() {
+	pins.mutex.Lock()
+	defer pins.mutex.Unlock()
+	for _, file := range pins.files {
+		_ = file.Close()
+	}
+	pins.files = nil
+	pins.closed = true
+}
+
 type artifactIdentity struct {
-	dev  uint64
-	ino  uint64
-	mode uint32
-	uid  uint32
+	dev      uint64
+	ino      uint64
+	mode     uint32
+	uid      uint32
+	rejected bool // A detected creation failure must never become partial-cleanup authority.
 }
 
 func lstatIdentity(path string) (artifactIdentity, error) {
@@ -281,6 +364,6 @@ func lstatIdentity(path string) (artifactIdentity, error) {
 }
 
 func sameIdentity(left artifactIdentity, right artifactIdentity) bool {
-	return left.dev == right.dev && left.ino == right.ino &&
+	return !left.rejected && !right.rejected && left.dev == right.dev && left.ino == right.ino &&
 		left.mode == right.mode && left.uid == right.uid
 }

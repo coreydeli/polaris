@@ -3,6 +3,7 @@
  * @brief Test src/logging.*.
  */
 #include "../tests_common.h"
+#include "../tests_environment.h"
 #include "../tests_log_checker.h"
 #include "../tests_paths.h"
 
@@ -17,6 +18,10 @@
 #include <sstream>
 #include <src/bounded_log_file.h>
 #include <src/logging.h>
+
+extern "C" {
+#include <libavutil/log.h>
+}
 
 namespace {
   std::array log_levels = {
@@ -279,11 +284,24 @@ TEST(LoggingOwnerLock, SecondInitFallsBackToConsoleAndLeavesOwnedFilesUntouched)
   EXPECT_TRUE(fs::exists(active.string() + ".backup"));
   guard.reset();
 
-  // Restore the harness's file logging for later suites; the environment's
-  // lifetime guard still tears logging down at binary exit, so this init's
-  // own guard is intentionally leaked rather than deinitializing on scope
-  // exit and leaving the shared log file sinkless.
-  (void) logging::init(0, test_paths::log_file().string()).release();
+  // Keep the replacement guard owned by the test environment until teardown.
+  PolarisEnvironment::restore_logging();
 
   fs::remove_all(root, error);
+}
+
+TEST(LoggingTests, LibavErrorsSurviveEveryVerbosity) {
+  // Silencing libav at the default verbosity is how an encoder refusing to open
+  // became a silent fall back to software. FFmpeg names the required and the
+  // found nvenc API versions in its own error line; Polaris only ever printed
+  // the resulting "Function not implemented".
+  EXPECT_EQ(logging::av_log_level_for(2), AV_LOG_ERROR);
+  EXPECT_EQ(logging::av_log_level_for(3), AV_LOG_ERROR);
+  EXPECT_EQ(logging::av_log_level_for(1), AV_LOG_WARNING);
+  EXPECT_EQ(logging::av_log_level_for(0), AV_LOG_DEBUG);
+
+  for (int verbosity = 0; verbosity <= 5; ++verbosity) {
+    EXPECT_GE(logging::av_log_level_for(verbosity), AV_LOG_ERROR)
+      << "verbosity " << verbosity << " discards libav errors";
+  }
 }

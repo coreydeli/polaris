@@ -344,6 +344,139 @@ TEST(SourceSafetyContracts, LegacyVirtualDisplayPromotionPrecedesCaptureReevalua
   EXPECT_NE(teardown.find("config::video.capture = initial_capture"), std::string::npos);
 }
 
+TEST(SourceSafetyContracts, ASessionDisplayOverrideNeverBecomesTheAdvertisedHostDefault) {
+  // A session override rewrites config::video.linux_display and the capture
+  // backend in place, and a paused session holds that rewrite for its whole
+  // resume window. Every site that arms the override has to publish the host
+  // policy it displaced, and teardown has to retire it, or the host recommends
+  // one client's topology to the next.
+  std::ifstream process_input(fs::path {POLARIS_SOURCE_DIR} / "src/process.cpp");
+  ASSERT_TRUE(process_input.is_open());
+  std::ostringstream process_contents;
+  process_contents << process_input.rdbuf();
+  const auto process_source = process_contents.str();
+
+  const auto armed = [&process_source]() {
+    size_t count = 0;
+    for (size_t at = process_source.find("initial_linux_display_saved = true");
+         at != std::string::npos;
+         at = process_source.find("initial_linux_display_saved = true", at + 1)) {
+      ++count;
+    }
+    return count;
+  }();
+  const auto published = [&process_source]() {
+    size_t count = 0;
+    for (size_t at = process_source.find("remember_host_display_default(*this)");
+         at != std::string::npos;
+         at = process_source.find("remember_host_display_default(*this)", at + 1)) {
+      ++count;
+    }
+    return count;
+  }();
+  EXPECT_EQ(published, armed)
+    << "every site that arms a session display override must publish the host default it displaced";
+  EXPECT_NE(process_source.find("stream_display_policy::forget_host_default()"), std::string::npos)
+    << "teardown must retire the published host default";
+
+  // The advice surfaces must read the host policy, not the live config.
+  std::ifstream nvhttp_input(fs::path {POLARIS_SOURCE_DIR} / "src/nvhttp.cpp");
+  ASSERT_TRUE(nvhttp_input.is_open());
+  std::ostringstream nvhttp_contents;
+  nvhttp_contents << nvhttp_input.rdbuf();
+  const auto nvhttp_source = nvhttp_contents.str();
+
+  const auto prefers = nvhttp_source.find("bool host_prefers_headless()");
+  ASSERT_NE(prefers, std::string::npos);
+  const auto prefers_end = nvhttp_source.find('}', nvhttp_source.find("#endif", prefers));
+  ASSERT_NE(prefers_end, std::string::npos);
+  const auto prefers_body = nvhttp_source.substr(prefers, prefers_end - prefers);
+  EXPECT_NE(prefers_body.find("host_default"), std::string::npos)
+    << "the launch-mode recommendation must answer from the host default";
+  EXPECT_EQ(prefers_body.find("resolve_current"), std::string::npos)
+    << "resolve_current reads the session-mutated config";
+
+  // And the backend substitution that discards a configured capture must say so.
+  std::ifstream policy_input(fs::path {POLARIS_SOURCE_DIR} / "src/platform/linux/stream_display_policy.cpp");
+  ASSERT_TRUE(policy_input.is_open());
+  std::ostringstream policy_contents;
+  policy_contents << policy_input.rdbuf();
+  const auto policy_source = policy_contents.str();
+
+  const auto normalize = policy_source.find("void normalize_host_virtual_display_state_for_backend(");
+  ASSERT_NE(normalize, std::string::npos);
+  const auto normalize_end = policy_source.find("\n  }", normalize);
+  ASSERT_NE(normalize_end, std::string::npos);
+  const auto normalize_body = policy_source.substr(normalize, normalize_end - normalize);
+  EXPECT_NE(normalize_body.find("previous_capture"), std::string::npos);
+  EXPECT_NE(normalize_body.find("BOOST_LOG"), std::string::npos)
+    << "silently replacing an operator's capture backend is what made this bug invisible";
+}
+
+TEST(SourceSafetyContracts, RefusingToKeepPrivateStateSaysWhichDirectoryAndWhy) {
+  // Everything downstream of this rejection reports only that a write did not
+  // commit, which sends people looking at the file they were saving instead of
+  // at the directory that refused it. One sudo run is enough to cause it, and
+  // for one release the failure had no log line at all.
+  std::ifstream input(fs::path {POLARIS_SOURCE_DIR} / "src/private_state_file.cpp");
+  ASSERT_TRUE(input.is_open());
+  std::ostringstream contents;
+  contents << input.rdbuf();
+  const auto source = contents.str();
+
+  const auto guard = source.find("bool secure_directory_descriptor(");
+  ASSERT_NE(guard, std::string::npos);
+  EXPECT_NE(source.find("directory_refusal_t *refusal", guard), std::string::npos)
+    << "the guard must report why it refused and which remedy applies, not just that it did; "
+       "the two faults it detects are fixed by different commands";
+
+  EXPECT_NE(source.find("Refusing to keep private state in ["), std::string::npos)
+    << "the rejection must name the directory it refused";
+  EXPECT_NE(source.find("owner uid "), std::string::npos)
+    << "the rejection must name the owner and the mode, which is what is wrong";
+  EXPECT_NE(source.find("without sudo"), std::string::npos)
+    << "a directory owned by another user must still point at running without sudo";
+  EXPECT_NE(source.find("chmod 700 "), std::string::npos)
+    << "a group-writable directory is fixed by chmod, not chown; offering only chown sent a "
+       "reporter on discussion #637 looking for an ownership problem they did not have";
+  // Which directory the message names is pinned behaviourally by
+  // PrivateStateFileTest.RefusalNamesTheDirectoryThatFailedAndItsOwnRemedy,
+  // because naming the state file's parent instead of the refused component is
+  // exactly the defect that shipped.
+  EXPECT_EQ(source.find("path_.parent_path().string() << \"] because\""), std::string::npos)
+    << "the refused directory is the one the walk stopped on, not the state file's parent";
+}
+
+TEST(SourceSafetyContracts, EveryLaunchTopologyResolverCallPassesTheHostPrivateDisplayAnswer) {
+  // A resume validates topology with the same resolver its launch used. If one
+  // call site answers "the host already provides the display" and another does
+  // not, a resume can reject the very session its own launch produced.
+  for (const auto *relative : {"src/process.cpp", "src/nvhttp.cpp"}) {
+    std::ifstream input(fs::path {POLARIS_SOURCE_DIR} / relative);
+    ASSERT_TRUE(input.is_open()) << relative;
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    const auto source = contents.str();
+
+    size_t calls = 0;
+    for (size_t at = source.find("effective_session_selection_for_launch(");
+         at != std::string::npos;
+         at = source.find("effective_session_selection_for_launch(", at + 1)) {
+      const auto close = source.find(");", at);
+      ASSERT_NE(close, std::string::npos) << relative;
+      const auto arguments = source.substr(at, close - at);
+      const bool passes_the_host_answer =
+        arguments.find("host_default_provides_private_display()") != std::string::npos ||
+        arguments.find("host_private") != std::string::npos;
+      EXPECT_TRUE(passes_the_host_answer)
+        << relative << " resolves a launch topology without passing the host's own answer, "
+        << "either by calling host_default_provides_private_display() or by passing a host_private local";
+      ++calls;
+    }
+    EXPECT_GT(calls, 0u) << relative << " no longer resolves launch topology at all";
+  }
+}
+
 TEST(SourceSafetyContracts, LinuxVirtualDisplayCreationUsesOnlyTheEffectiveMode) {
   std::ifstream input(fs::path {POLARIS_SOURCE_DIR} / "src/process.cpp");
   ASSERT_TRUE(input.is_open());
@@ -433,7 +566,7 @@ TEST(SourceSafetyContracts, ExactDisplayCaptureCannotFallBackDuringInitOrReinit)
   const auto wrapper = source.substr(generic_refresh, capture_thread - generic_refresh);
   EXPECT_NE(wrapper.find("if (!refresh_displays("), std::string::npos);
   EXPECT_NE(
-    wrapper.find("current_display_index = display_names.empty() ? -1 : 0"),
+    wrapper.find("current_display_index = -1"),
     std::string::npos
   );
 }
@@ -720,9 +853,13 @@ TEST(SourceSafetyContracts, LinuxBackendDispatchUsesCaptureGenerationAuthority) 
   const auto source = contents.str();
 
   const auto planner = source.find("static display_backend_e choose_display_backend(");
-  const auto display = source.find("std::shared_ptr<display_t> display(", planner);
+  const auto selection = source.find("static display_backend_e selected_display_backend(", planner);
+  const auto prepare = source.find("bool prepare_desktop_capture(", selection);
+  const auto display = source.find("std::shared_ptr<display_t> display(", prepare);
   const auto display_end = source.find("class linux_deinit_t", display);
   ASSERT_NE(planner, std::string::npos);
+  ASSERT_NE(selection, std::string::npos);
+  ASSERT_NE(prepare, std::string::npos);
   ASSERT_NE(display, std::string::npos);
   ASSERT_NE(display_end, std::string::npos);
   const auto planner_body = source.substr(planner, display - planner);
@@ -730,17 +867,21 @@ TEST(SourceSafetyContracts, LinuxBackendDispatchUsesCaptureGenerationAuthority) 
   EXPECT_NE(planner_body.find("exact_output_owned && (requested.empty() || requested == \"auto\")"), std::string::npos);
   EXPECT_NE(planner_body.find("requested == \"wlr\""), std::string::npos);
   EXPECT_NE(planner_body.find("requested == \"portal\""), std::string::npos);
-  const auto requested = display_body.find("config.capture_generation.capture_backend");
-  const auto exact_owned = display_body.find("config.capture_generation.exact_display_name.empty()", requested);
-  const auto choose = display_body.find("choose_display_backend(", exact_owned);
-  const auto dispatch = display_body.find("switch (backend)", choose);
+  const auto selection_body = source.substr(selection, prepare - selection);
+  const auto requested = selection_body.find("config.capture_generation.capture_backend");
+  const auto exact_owned = selection_body.find("config.capture_generation.exact_display_name.empty()", requested);
+  const auto choose = selection_body.find("choose_display_backend(", exact_owned);
+  const auto dispatch_selection = display_body.find("selected_display_backend(hwdevice_type, config)");
+  const auto dispatch = display_body.find("switch (backend)", dispatch_selection);
   ASSERT_NE(requested, std::string::npos);
   ASSERT_NE(exact_owned, std::string::npos);
   ASSERT_NE(choose, std::string::npos);
+  ASSERT_NE(dispatch_selection, std::string::npos);
   ASSERT_NE(dispatch, std::string::npos);
   EXPECT_LT(requested, exact_owned);
   EXPECT_LT(exact_owned, choose);
-  EXPECT_LT(choose, dispatch);
+  EXPECT_LT(dispatch_selection, dispatch);
+  EXPECT_NE(source.substr(prepare, display - prepare).find("selected_display_backend(hwdevice_type, config)"), std::string::npos);
   EXPECT_EQ(display_body.find("if (sources[source::"), std::string::npos);
 }
 
@@ -887,11 +1028,15 @@ TEST(SourceSafetyContracts, PortalSourceSelectionAndIdentityTransitionOwnOneGene
   EXPECT_EQ(portal.substr(capture_fallback, capture_owner - capture_fallback).find("ensure_global_session()"), std::string::npos);
 
   const auto transition = portal.find("capture configuration changed");
-  const auto retired_portal = portal.find("auto retired_portal = std::move(g_media.portal)", transition);
+  const auto retained = portal.find("const bool retain_prepared_portal = g_media.prepared_token &&", transition);
+  const auto same_source = portal.find("g_media.generation == generation", retained);
+  const auto retired_portal = portal.find("auto retired_portal = retain_prepared_portal ? nullptr : std::move(g_media.portal)", same_source);
   const auto unlock = portal.find("lock.unlock()", transition);
   const auto destroy_portal = portal.find("retired_portal.reset()", unlock);
   const auto relock = portal.find("lock.lock()", destroy_portal);
   ASSERT_NE(transition, std::string::npos);
+  ASSERT_NE(retained, std::string::npos);
+  ASSERT_NE(same_source, std::string::npos);
   ASSERT_NE(retired_portal, std::string::npos);
   ASSERT_NE(unlock, std::string::npos);
   ASSERT_NE(destroy_portal, std::string::npos);

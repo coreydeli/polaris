@@ -24,7 +24,6 @@ const (
 	gamescopeLimiterNamePrefix     = "polaris-gamescope-limiter-"
 	gamescopeSessionNamePrefix     = "polaris-gamescope-session-"
 	gamescopeArtifactNameDomain    = "polaris-gamescope-artifacts-v1\x00"
-	gamescopeSessionRecordHeader   = "POLARIS-GAMESCOPE-SESSION/1\n"
 	maximumGamescopeReadyRecord    = 64
 	defaultGamescopeStartupTimeout = 120 * time.Second
 )
@@ -43,7 +42,7 @@ type gamescopeReadyInfo struct {
 	waylandName   string
 }
 
-func RunNestedCompositor(arguments []string, environment []string) error {
+func RunNestedCompositor(arguments []string, environment []string) (result error) {
 	request, err := parseProviderInvocation(
 		seatruntime.StageNestedCompositor,
 		arguments,
@@ -62,6 +61,15 @@ func RunNestedCompositor(arguments []string, environment []string) error {
 	// application timeout and may never expose an app id.
 	options.startupTimeout = defaultGamescopeStartupTimeout
 	options, err = normalizeProviderOptions(options)
+	if err != nil {
+		_ = ready.Close()
+		return err
+	}
+	var cleanup func() error
+	options, cleanup, err = preparePrivateX11(options)
+	if cleanup != nil {
+		defer func() { result = errors.Join(result, cleanup()) }()
+	}
 	if err != nil {
 		_ = ready.Close()
 		return err
@@ -245,6 +253,18 @@ func rejectExistingGamescopeArtifacts(
 	return nil
 }
 
+func captureCreatedArtifact(runtime *runtimeDirectory, path string, descriptor int) (artifactIdentity, error) {
+	var created syscall.Stat_t
+	statError := syscall.Fstat(descriptor, &created)
+	identity, identityError := runtime.pins.capture(path)
+	if statError != nil || identityError != nil || !sameIdentity(identity, artifactIdentity{
+		dev: uint64(created.Dev), ino: created.Ino, mode: created.Mode, uid: created.Uid,
+	}) {
+		return artifactIdentity{rejected: true}, errors.New("runtime Gamescope created artifact was replaced")
+	}
+	return identity, nil
+}
+
 func createGamescopeRegularArtifact(
 	runtime *runtimeDirectory,
 	path string,
@@ -262,12 +282,12 @@ func createGamescopeRegularArtifact(
 		0o600,
 	)
 	if err != nil {
-		return artifactIdentity{}, errors.New("runtime Gamescope artifact could not be created")
+		return artifactIdentity{rejected: true}, errors.New("runtime Gamescope artifact could not be created")
 	}
 	file := os.NewFile(uintptr(descriptor), "polaris-gamescope-artifact")
 	if file == nil {
 		_ = syscall.Close(descriptor)
-		return artifactIdentity{}, errors.New("runtime Gamescope artifact could not be created")
+		return artifactIdentity{rejected: true}, errors.New("runtime Gamescope artifact could not be created")
 	}
 	writeError := error(nil)
 	for remaining := content; len(remaining) > 0; {
@@ -281,11 +301,13 @@ func createGamescopeRegularArtifact(
 	if writeError == nil && len(content) > 0 {
 		writeError = file.Sync()
 	}
+	identity, identityError := captureCreatedArtifact(runtime, path, descriptor)
 	closeError := file.Close()
-	identity, identityError := lstatIdentity(path)
-	if writeError != nil || closeError != nil || identityError != nil ||
-		identity.mode&syscall.S_IFMT != syscall.S_IFREG ||
+	if identityError != nil || identity.mode&syscall.S_IFMT != syscall.S_IFREG ||
 		identity.uid != runtime.uid || identity.mode&0o7777 != 0o600 {
+		return artifactIdentity{rejected: true}, errors.New("runtime Gamescope created artifact ownership is invalid")
+	}
+	if writeError != nil || closeError != nil {
 		return identity, errors.New("runtime Gamescope artifact is invalid")
 	}
 	return identity, nil
@@ -302,12 +324,12 @@ func createGamescopeReadyFIFO(
 		return nil, artifactIdentity{}, err
 	}
 	if err := syscall.Mkfifo(path, 0o600); err != nil {
-		return nil, artifactIdentity{}, errors.New("runtime Gamescope readiness FIFO could not be created")
+		return nil, artifactIdentity{rejected: true}, errors.New("runtime Gamescope readiness FIFO could not be created")
 	}
-	identity, err := lstatIdentity(path)
+	identity, err := runtime.pins.capture(path)
 	if err != nil || identity.mode&syscall.S_IFMT != syscall.S_IFIFO ||
 		identity.uid != runtime.uid || identity.mode&0o7777 != 0o600 {
-		return nil, identity, errors.New("runtime Gamescope readiness FIFO is invalid")
+		return nil, artifactIdentity{rejected: true}, errors.New("runtime Gamescope readiness FIFO is invalid")
 	}
 	descriptor, err := syscall.Open(
 		path,
@@ -322,7 +344,26 @@ func createGamescopeReadyFIFO(
 		_ = syscall.Close(descriptor)
 		return nil, identity, errors.New("runtime Gamescope readiness FIFO is unavailable")
 	}
+	opened, err := captureCreatedArtifact(runtime, path, descriptor)
+	if err != nil || !sameIdentity(opened, identity) {
+		_ = file.Close()
+		return nil, artifactIdentity{rejected: true}, errors.New("runtime Gamescope readiness FIFO was replaced")
+	}
 	return file, identity, nil
+}
+
+// describeChildExit names how a child finished, so a helper that refused to
+// start says more than that it did not become ready. Gamescope reports the
+// reason itself on stderr, which the supervisor's diagnostic sink keeps.
+func describeChildExit(child *managedChild) string {
+	if child == nil || child.command == nil || child.command.ProcessState == nil {
+		return "an unreported status"
+	}
+	state := child.command.ProcessState
+	if status, ok := state.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return "signal " + strconv.Itoa(int(status.Signal()))
+	}
+	return "status " + strconv.Itoa(state.ExitCode())
 }
 
 func waitForGamescopeReadyRecord(
@@ -353,7 +394,9 @@ func waitForGamescopeReadyRecord(
 		return "", errors.New("runtime Gamescope startup was canceled")
 	case <-child.done:
 		_ = ready.Close()
-		return "", errors.New("runtime Gamescope exited before readiness")
+		return "", errors.New(
+			"runtime Gamescope exited before readiness with " + describeChildExit(child),
+		)
 	case received := <-result:
 		if received.err != nil {
 			return "", errors.New("runtime Gamescope readiness was invalid")
@@ -402,7 +445,7 @@ func captureGamescopeArtifacts(
 			continue
 		}
 		path := filepath.Join(runtime.path, entry.Name())
-		identity, err := lstatIdentity(path)
+		identity, err := runtime.pins.capture(path)
 		if err != nil || !validGamescopeArtifact(identity, mode, runtime.uid) {
 			result = errors.Join(
 				result,
@@ -492,14 +535,6 @@ func prepareGamescopeWaylandAlias(
 	return nil
 }
 
-func gamescopeSessionRecord(info gamescopeReadyInfo, targetWayland string) []byte {
-	return []byte(gamescopeSessionRecordHeader +
-		"DISPLAY=" + info.displayName + "\n" +
-		"STEAM_GAME_DISPLAY_0=" + info.displayName + "\n" +
-		"WAYLAND_DISPLAY=" + targetWayland + "\n" +
-		"GAMESCOPE_WAYLAND_DISPLAY=" + targetWayland + "\n")
-}
-
 func verifyParentWaylandIdentity(
 	runtime *runtimeDirectory,
 	path string,
@@ -537,7 +572,7 @@ func captureX11Baseline(
 			display,
 		)
 		for _, path := range []string{socketPath, lockPath} {
-			identity, err := lstatIdentity(path)
+			identity, err := socketDirectory.pins.capture(path)
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
@@ -589,7 +624,7 @@ func captureGamescopeX11Artifacts(
 		{socketPath, syscall.S_IFSOCK},
 		{lockPath, syscall.S_IFREG},
 	} {
-		identity, err := lstatIdentity(artifact.path)
+		identity, err := socketDirectory.pins.capture(artifact.path)
 		if err != nil || !validGamescopeArtifact(identity, artifact.mode, uid) {
 			return captured, "", errors.New("runtime Gamescope X11 artifact is invalid")
 		}
@@ -635,8 +670,8 @@ func capturePartialGamescopeX11Artifacts(
 			lockDirectory.path,
 			display,
 		)
-		socketIdentity, socketError := lstatIdentity(socketPath)
-		lockIdentity, lockError := lstatIdentity(lockPath)
+		socketIdentity, socketError := socketDirectory.pins.capture(socketPath)
+		lockIdentity, lockError := socketDirectory.pins.capture(lockPath)
 		socketMissing := errors.Is(socketError, os.ErrNotExist)
 		lockMissing := errors.Is(lockError, os.ErrNotExist)
 		if socketMissing && lockMissing {
@@ -836,7 +871,7 @@ func runNestedCompositor(
 	x11Locks, err := openFixedDirectory(
 		options.x11LockDirectory,
 		options.x11DirectoryOwnerUID,
-		options.x11DirectoryMode,
+		options.x11LockDirectoryMode,
 	)
 	if err != nil {
 		return err
@@ -868,7 +903,7 @@ func runNestedCompositor(
 	if err := rejectExistingGamescopeArtifacts(runtime, paths); err != nil {
 		return err
 	}
-	parentIdentity, err := lstatIdentity(paths.parentSocket)
+	parentIdentity, err := runtime.pins.capture(paths.parentSocket)
 	if err != nil || !validGamescopeArtifact(
 		parentIdentity,
 		syscall.S_IFSOCK,
@@ -943,9 +978,11 @@ func runNestedCompositor(
 		cleanupError := cleanupGamescopeRuntimeArtifacts(runtime, paths, knownRuntime, false)
 		return errors.Join(err, cleanupError)
 	}
+	var lifetime *processLifetime
 	readyPublished := false
 	knownX11 := make(map[string]artifactIdentity)
 	defer func() {
+		defer func() { lifetime.close() }()
 		_ = readyFIFO.Close()
 		stopError := child.stop(options.stopTimeout)
 		if !readyPublished && len(knownX11) == 0 {
@@ -1050,10 +1087,17 @@ func runNestedCompositor(
 	if child.exited() {
 		return errors.New("runtime Gamescope exited before readiness")
 	}
+	if child.pidFD == nil {
+		return errors.New("compositor lifetime unavailable")
+	}
+	lifetime, err = retainProcessLifetime(child.command.Process.Pid, int(child.pidFD.Fd()), processCookie{})
+	if err != nil {
+		return err
+	}
 	sessionIdentity, err := createGamescopeRegularArtifact(
 		runtime,
 		paths.sessionRecord,
-		gamescopeSessionRecord(info, request.WaylandSocket),
+		gamescopeLauncherRecord(info, request, child.command.Process.Pid, lifetime.cookie),
 	)
 	if sessionIdentity != (artifactIdentity{}) {
 		knownRuntime[paths.sessionRecord] = sessionIdentity
@@ -1061,12 +1105,17 @@ func runNestedCompositor(
 	if err != nil {
 		return err
 	}
-	knownRuntime, err = captureGamescopeArtifacts(
+	capturedRuntime, err := captureGamescopeArtifacts(
 		runtime,
 		paths,
 		knownRuntime,
 		true,
 	)
+	// A failed capture omits conflicting paths. Retain their original ownership
+	// so deferred partial cleanup cannot rediscover and adopt the replacements.
+	for path, identity := range capturedRuntime {
+		knownRuntime[path] = identity
+	}
 	if err != nil {
 		return err
 	}

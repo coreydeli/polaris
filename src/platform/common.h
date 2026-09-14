@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <atomic>
 #include <bitset>
 #include <filesystem>
 #include <functional>
@@ -626,6 +627,12 @@ namespace platf {
 
     virtual int dummy_img(img_t *img) = 0;
 
+    // An empty result declines in-process probe reuse. Implementations report
+    // the actual connected route; configuration alone cannot establish it.
+    virtual std::string encoder_probe_route() const {
+      return {};
+    }
+
     virtual std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e pix_fmt) {
       return nullptr;
     }
@@ -744,6 +751,12 @@ namespace platf {
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
 
+#ifdef __linux__
+  // Only the selected portal backend needs interactive Desktop preparation.
+  bool prepare_desktop_capture(mem_type_e hwdevice_type, const video::config_t &config,
+                               std::shared_ptr<void> &preparation);
+#endif
+
   // A list of names of displays accepted as display_name with the mem_type_e
   std::vector<std::string> display_names(mem_type_e hwdevice_type);
 #ifdef __linux__
@@ -778,6 +791,30 @@ namespace platf {
    * per-session mode can cross capture families without a restart (Linux).
    */
   void reevaluate_capture_sources();
+
+#ifdef __linux__
+  /**
+   * @brief Describe a capture backend substitution, as "requested -> selected".
+   * @return Empty when the configured backend was the one actually used.
+   */
+  std::string capture_backend_substitution_note();
+
+  /**
+   * @brief Whether an evaluation ran and found no capture source at all.
+   * @return False before any evaluation has run, so this never reports an unlooked-for problem.
+   */
+  bool capture_sources_missing();
+
+  #ifdef POLARIS_TESTS
+  /// Drive the missing-capture state directly, so the reporting can be tested without a compositor.
+  void set_capture_sources_missing_for_tests(bool missing);
+  #endif
+
+  #ifdef POLARIS_TESTS
+  /// Set the substitution note directly, so the reporting can be tested without a compositor.
+  void set_capture_backend_substitution_for_tests(const std::string &note);
+  #endif
+#endif
 
   enum class thread_priority_e : int {
     low,  ///< Low priority
@@ -847,6 +884,12 @@ namespace platf {
     uint16_t target_port;
     boost::asio::ip::address &source_address;
 
+    // Per-session cancellation; the UDP socket is shared by other streams.
+    std::shared_ptr<const std::atomic_bool> cancellation;
+    bool cancelled() const noexcept {
+      return cancellation && cancellation->load(std::memory_order_acquire);
+    }
+
     /**
      * @brief Returns a payload buffer descriptor for the given payload offset.
      * @param offset The offset in the total payload data (bytes).
@@ -879,6 +922,10 @@ namespace platf {
     boost::asio::ip::address &target_address;
     uint16_t target_port;
     boost::asio::ip::address &source_address;
+    std::shared_ptr<const std::atomic_bool> cancellation;
+    bool cancelled() const noexcept {
+      return cancellation && cancellation->load(std::memory_order_acquire);
+    }
   };
 
   bool send(send_info_t &send_info);

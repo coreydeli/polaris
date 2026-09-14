@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <iterator>
 #include <random>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,21 +50,68 @@ namespace private_state_file {
       return flags;
     }
 
-    bool secure_directory_descriptor(int descriptor, bool final_parent) {
+    /**
+     * @brief Whether this directory may hold private state, and if not, why.
+     *
+     * The reason matters as much as the answer. A single `sudo polaris` leaves
+     * the per-user config directory owned by root, after which every later run
+     * as the user fails here forever, and the only thing the operator sees is
+     * that saving credentials did not work.
+     */
+    enum class directory_remedy_e {
+      none,  ///< Nothing actionable; the directory could not even be inspected.
+      take_ownership,  ///< Owned by another user, usually one "sudo polaris".
+      restrict_permissions,  ///< Group or other writable, usually a 002 umask.
+    };
+
+    struct directory_refusal_t {
+      std::string reason;
+      directory_remedy_e remedy = directory_remedy_e::none;
+    };
+
+    bool secure_directory_descriptor(int descriptor, bool final_parent, directory_refusal_t *refusal = nullptr) {
+      const auto refuse = [refusal](std::string explanation, directory_remedy_e remedy) {
+        if (refusal) {
+          refusal->reason = std::move(explanation);
+          refusal->remedy = remedy;
+        }
+        return false;
+      };
+
       struct stat metadata {};
       if (::fstat(descriptor, &metadata) != 0 || !S_ISDIR(metadata.st_mode)) {
-        return false;
+        return refuse("it is not a directory this process can inspect", directory_remedy_e::none);
       }
 
       const auto effective_user = ::geteuid();
       const auto writable_by_others = (metadata.st_mode & (S_IWGRP | S_IWOTH)) != 0;
+      const auto describe = [&metadata, effective_user](std::string_view problem) {
+        std::ostringstream detail;
+        detail << problem << " (owner uid " << metadata.st_uid
+               << ", mode 0" << std::oct << (metadata.st_mode & 07777) << std::dec
+               << ", this process runs as uid " << effective_user << ')';
+        return detail.str();
+      };
+
       if (final_parent) {
-        return metadata.st_uid == effective_user && !writable_by_others;
+        if (metadata.st_uid != effective_user) {
+          return refuse(describe("it is owned by another user"), directory_remedy_e::take_ownership);
+        }
+        if (writable_by_others) {
+          return refuse(describe("it is writable by group or other"), directory_remedy_e::restrict_permissions);
+        }
+        return true;
       }
 
       const auto trusted_owner = metadata.st_uid == 0 || metadata.st_uid == effective_user;
       const auto sticky_when_writable = !writable_by_others || (metadata.st_mode & S_ISVTX) != 0;
-      return trusted_owner && sticky_when_writable;
+      if (!trusted_owner) {
+        return refuse(describe("a parent directory is owned by another user"), directory_remedy_e::take_ownership);
+      }
+      if (!sticky_when_writable) {
+        return refuse(describe("a parent directory is writable by others without the sticky bit"), directory_remedy_e::restrict_permissions);
+      }
+      return true;
     }
 
     std::filesystem::path trusted_home_symlink() {
@@ -167,7 +215,7 @@ namespace private_state_file {
         }
 
         descriptor_ = ::open(path_.is_absolute() ? "/" : ".", directory_open_flags());
-        if (descriptor_ < 0 || !secure_directory_descriptor(descriptor_, components.empty())) {
+        if (descriptor_ < 0 || !secure_directory_descriptor(descriptor_, components.empty(), nullptr)) {
           (void) close();
           return;
         }
@@ -197,9 +245,39 @@ namespace private_state_file {
             parent_entry_needs_sync = true;
             next = ::openat(descriptor_, component.c_str(), directory_open_flags());
           }
-          if (next < 0 || !secure_directory_descriptor(next, final_parent)) {
+          directory_refusal_t refusal;
+          if (next < 0 || !secure_directory_descriptor(next, final_parent, &refusal)) {
             if (next >= 0) {
               ::close(next);
+            }
+            if (!refusal.reason.empty()) {
+              // The only place this is ever explained. Everything downstream
+              // reports that a write did not commit, which sends people looking
+              // at the file they were saving rather than at the directory.
+              //
+              // Name the directory the walk actually refused. Reporting the
+              // state file's parent instead sent one reporter to a directory
+              // whose mode was fine while quoting the mode of another.
+              auto rejected = path_.is_absolute() ? std::filesystem::path {"/"} : std::filesystem::path {};
+              for (std::size_t walked = 0; walked <= index; ++walked) {
+                rejected /= components[walked];
+              }
+              std::string remedy;
+              switch (refusal.remedy) {
+                case directory_remedy_e::take_ownership:
+                  remedy = ". Take it back with \"sudo chown -R \"$USER\": " + rejected.string() +
+                           "\" and start Polaris without sudo; one \"sudo polaris\" is enough to leave it root-owned.";
+                  break;
+                case directory_remedy_e::restrict_permissions:
+                  remedy = ". Restrict it with \"chmod 700 " + rejected.string() +
+                           "\"; a umask of 002 is enough to leave it group writable.";
+                  break;
+                case directory_remedy_e::none:
+                  break;
+              }
+              BOOST_LOG(error) << "Refusing to keep private state in ["
+                               << rejected.string() << "] because "
+                               << refusal.reason << remedy;
             }
             (void) close();
             return;
@@ -295,7 +373,7 @@ namespace private_state_file {
 
     class state_file_lock_t {
     public:
-      explicit state_file_lock_t(const directory_handle_t &directory) {
+      explicit state_file_lock_t(const directory_handle_t &directory, bool wait = true) {
         int flags = O_CREAT | O_RDWR | O_NONBLOCK;
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
@@ -320,7 +398,7 @@ namespace private_state_file {
           descriptor_ = -1;
           return;
         }
-        while (::flock(descriptor_, LOCK_EX) != 0) {
+        while (::flock(descriptor_, LOCK_EX | (wait ? 0 : LOCK_NB)) != 0) {
           if (errno == EINTR) {
             continue;
           }
@@ -400,18 +478,8 @@ namespace private_state_file {
     }
   }  // namespace
 
-  read_result_t read_secure(const std::filesystem::path &target, std::size_t max_bytes) {
-    directory_handle_t directory {target};
-    if (!directory) {
-      BOOST_LOG(error) << "Rejected insecure or inaccessible private state directory for " << target;
-      return {.status = read_status_e::io_error};
-    }
-    state_file_lock_t lock {directory};
-    if (!lock) {
-      BOOST_LOG(error) << "Couldn't acquire private state lock for " << target;
-      return {.status = read_status_e::io_error};
-    }
-
+  static read_result_t read_locked(const directory_handle_t &directory, std::size_t max_bytes,
+                                   bool permit_public_read) {
     int flags = O_RDONLY | O_NONBLOCK;
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
@@ -445,7 +513,7 @@ namespace private_state_file {
       return {.status = read_status_e::io_error};
     }
     if (!S_ISREG(metadata.st_mode) || metadata.st_uid != ::geteuid() || metadata.st_nlink != 1 ||
-        (metadata.st_mode & (S_IRWXG | S_IRWXO)) != 0 || metadata.st_size < 0 ||
+        (metadata.st_mode & (permit_public_read ? (S_IWGRP | S_IWOTH) : (S_IRWXG | S_IRWXO))) != 0 || metadata.st_size < 0 ||
         static_cast<std::uintmax_t>(metadata.st_size) > max_bytes) {
       (void) close_descriptor();
       return {.status = read_status_e::rejected};
@@ -483,18 +551,7 @@ namespace private_state_file {
     return {.status = read_status_e::ok, .payload = std::move(payload)};
   }
 
-  write_result_t write_atomic(const std::filesystem::path &target, std::string_view payload) {
-    directory_handle_t directory {target, true};
-    if (!directory) {
-      BOOST_LOG(error) << "Rejected insecure or inaccessible private state directory for " << target;
-      return {write_status_e::not_committed};
-    }
-    state_file_lock_t lock {directory};
-    if (!lock) {
-      BOOST_LOG(error) << "Couldn't acquire private state lock for " << target;
-      return {write_status_e::not_committed};
-    }
-
+  static write_result_t write_locked(directory_handle_t &directory, std::string_view payload) {
 #ifdef POLARIS_TESTS
     const auto injected_fault = write_fault.load(std::memory_order_relaxed);
     if (injected_fault == write_fault_e::open) {
@@ -611,6 +668,38 @@ namespace private_state_file {
       return {write_status_e::durability_uncertain};
     }
     return {write_status_e::committed};
+  }
+
+  read_result_t read_secure(const std::filesystem::path &target, std::size_t max_bytes,
+                            bool permit_public_read, bool wait_for_lock) {
+    directory_handle_t directory {target};
+    if (!directory) return {.status = read_status_e::io_error};
+    state_file_lock_t lock {directory, wait_for_lock};
+    if (!lock) return {.status = read_status_e::io_error};
+    return read_locked(directory, max_bytes, permit_public_read);
+  }
+
+  write_result_t write_atomic(const std::filesystem::path &target, std::string_view payload) {
+    directory_handle_t directory {target, true};
+    if (!directory) return {write_status_e::not_committed};
+    state_file_lock_t lock {directory};
+    if (!lock) return {write_status_e::not_committed};
+    return write_locked(directory, payload);
+  }
+
+  write_result_t update_atomic(const std::filesystem::path &target, std::size_t max_bytes,
+      const std::function<std::optional<std::string>(const read_result_t &)> &update,
+      bool permit_public_read) {
+    directory_handle_t directory {target, true};
+    if (!directory) return {write_status_e::not_committed};
+    state_file_lock_t lock {directory, false};
+    if (!lock) return {write_status_e::not_committed};
+    const auto current = read_locked(directory, max_bytes, permit_public_read);
+    if (!current && current.status != read_status_e::missing) return {write_status_e::not_committed};
+    const auto next = update(current);
+    if (!next || next->size() > max_bytes) return {write_status_e::not_committed};
+    if (current && *next == current.payload) return {write_status_e::committed};
+    return write_locked(directory, *next);
   }
 
 #ifdef POLARIS_TESTS

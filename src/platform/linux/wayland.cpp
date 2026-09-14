@@ -268,6 +268,17 @@ namespace wl {
 
   void monitor_t::xdg_size(zxdg_output_v1 *, std::int32_t width, std::int32_t height) {
     BOOST_LOG(info) << "Logical size: "sv << width << 'x' << height;
+
+    // wl_output.mode is the preferred source because it is in output pixels,
+    // which is what the capture hands back. But a compositor is only required to
+    // describe its outputs through xdg-output, and one that sends no current
+    // mode used to leave this monitor sized 0x0 while the desktop extents were
+    // known, which is the state that silently kills absolute input. Take the
+    // logical size when nothing better has arrived; a later mode overwrites it.
+    if (viewport.width <= 0 || viewport.height <= 0) {
+      viewport.width = width;
+      viewport.height = height;
+    }
   }
 
   void monitor_t::wl_mode(
@@ -277,6 +288,14 @@ namespace wl {
     std::int32_t height,
     std::int32_t refresh
   ) {
+    // A compositor may describe every mode the output supports. Only the
+    // current one describes what is on screen, and kwingrab.cpp already filters
+    // on it; taking whichever arrived last sized the monitor from an arbitrary
+    // mode.
+    if (!(flags & WL_OUTPUT_MODE_CURRENT)) {
+      return;
+    }
+
     viewport.width = width;
     viewport.height = height;
 
@@ -596,28 +615,29 @@ namespace wl {
       return false;
     }
 
-    int drm_fd = -1;
+    file_t drm_fd;
     for (int i = 0; i < n; i++) {
       if (devices[i]->available_nodes & (1 << DRM_NODE_RENDER)) {
-        drm_fd = open(devices[i]->nodes[DRM_NODE_RENDER], O_RDWR);
-        if (drm_fd >= 0) {
+        drm_fd.el = open(devices[i]->nodes[DRM_NODE_RENDER], O_RDWR | O_CLOEXEC);
+        if (drm_fd.el >= 0) {
           break;
         }
       }
     }
     drmFreeDevices(devices, n);
 
-    if (drm_fd < 0) {
+    if (drm_fd.el < 0) {
       BOOST_LOG(error) << "Failed to open DRM render node"sv;
       return false;
     }
 
-    gbm_device = gbm_create_device(drm_fd);
+    gbm_device = gbm_create_device(drm_fd.el);
     if (!gbm_device) {
-      close(drm_fd);
       BOOST_LOG(error) << "Failed to create GBM device"sv;
       return false;
     }
+
+    gbm_fd = std::move(drm_fd);
 
     static bool logged_gbm_backend = false;
     if (!logged_gbm_backend) {
@@ -693,7 +713,6 @@ namespace wl {
     }
 
     if (gbm_device) {
-      // We should close the DRM FD, but it's owned by GBM
       gbm_device_destroy(gbm_device);
       gbm_device = nullptr;
     }
@@ -1308,19 +1327,19 @@ namespace wl {
       return false;
     }
 
-    auto drm_fd = open(node.c_str(), O_RDWR | O_CLOEXEC);
-    if (drm_fd < 0) {
+    file_t drm_fd {open(node.c_str(), O_RDWR | O_CLOEXEC)};
+    if (drm_fd.el < 0) {
       BOOST_LOG(error) << "Extcopy DMA-BUF capture failed to open DRM node ["sv << node << ']';
       return false;
     }
 
-    gbm_device = gbm_create_device(drm_fd);
+    gbm_device = gbm_create_device(drm_fd.el);
     if (!gbm_device) {
-      close(drm_fd);
       BOOST_LOG(error) << "Extcopy DMA-BUF capture failed to create GBM device"sv;
       return false;
     }
 
+    gbm_fd = std::move(drm_fd);
     gbm_device_id = device;
     gbm_device_id_valid = true;
     render_node = path_for_fd(gbm_device_get_fd(gbm_device));
@@ -1340,6 +1359,8 @@ namespace wl {
       gbm_device_destroy(gbm_device);
       gbm_device = nullptr;
     }
+
+    gbm_fd = {};
 
     gbm_device_id = {};
     gbm_device_id_valid = false;

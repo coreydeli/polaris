@@ -6,6 +6,10 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#ifdef __linux__
+  #include "platform/linux/process_environment.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -55,6 +59,8 @@
 
 // local includes
 #include "config.h"
+#include "configuration_store.h"
+#include "live_tuning.h"
 #include "config_file_update.h"
 #include "display_device.h"
 #include "display_planner.h"
@@ -833,9 +839,11 @@ namespace nvhttp {
 
     bool host_prefers_headless() {
 #ifdef __linux__
-      // One resolve_current snapshot for the two flags (no hand-built input_t thrash).
-      const auto resolved = stream_display_policy::resolve_current();
-      return resolved.uses_labwc() && resolved.requested_headless;
+      // The host's own policy, not the session parked on it. A session-scoped
+      // override rewrites the live config, and a paused session keeps it
+      // rewritten for its whole resume window, so reading live values here
+      // would recommend one client's topology to the next one that asks.
+      return stream_display_policy::host_default_provides_private_display();
 #else
       return false;
 #endif
@@ -1262,78 +1270,10 @@ namespace nvhttp {
     }
 
     bool persist_config_values(const std::unordered_map<std::string, std::string> &updates) {
-      if (updates.empty()) {
-        return true;
-      }
-
-      const fs::path target {config::sunshine.config_file};
-      std::error_code metadata_error;
-      const auto metadata = fs::symlink_status(target, metadata_error);
-      if (metadata_error || !fs::exists(metadata) || !fs::is_regular_file(metadata)) {
-        BOOST_LOG(error) << "client_settings: refusing to replace missing, unreadable, or non-regular config file: "sv
-                         << target;
-        return false;
-      }
-
-      std::ifstream input {target, std::ios::binary};
-      if (!input.is_open()) {
-        BOOST_LOG(error) << "client_settings: failed to open config file for a lossless update: "sv << target;
-        return false;
-      }
-      const std::string existing_config {
-        std::istreambuf_iterator<char> {input},
-        std::istreambuf_iterator<char> {}
-      };
-      if (input.bad()) {
-        BOOST_LOG(error) << "client_settings: failed while reading config file: "sv << target;
-        return false;
-      }
-      input.close();
-      if (input.fail()) {
-        BOOST_LOG(error) << "client_settings: failed to close config file after reading: "sv << target;
-        return false;
-      }
-
-      const auto vars = config::parse_config(existing_config);
-      const bool unchanged = std::all_of(
-        updates.begin(), updates.end(),
-        [&](const auto &update) {
-          const auto existing_value = vars.find(update.first);
-          if (update.second.empty()) {
-            return existing_value == vars.end();
-          }
-          return existing_value != vars.end() && existing_value->second == update.second;
-        }
-      );
-      if (unchanged) {
-        return true;
-      }
-
-      const auto updated = config_file_update::apply(existing_config, updates);
-      if (!updated.changed) {
-        return true;
-      }
-
-      const auto persisted = private_state_file::write_atomic(target, updated.content);
-      if (persisted.status == private_state_file::write_status_e::not_committed) {
-        BOOST_LOG(error) << "client_settings: atomic config replacement did not commit: "sv << target;
-        return false;
-      }
-      if (persisted.status == private_state_file::write_status_e::durability_uncertain) {
-        // rename(2) already made the new config visible. Report the committed
-        // mutation honestly even though the parent-directory fsync/close could
-        // not prove crash durability; claiming unchanged would invite a retry.
-        BOOST_LOG(warning) << "client_settings: config replacement committed with uncertain durability: "sv
-                           << target;
-      }
-
-      std::vector<std::string> written_keys;
-      written_keys.reserve(updates.size());
-      for (const auto &update : updates) {
-        written_keys.push_back(update.first);
-      }
-      settings_metadata::note_config_write("gamestream", std::move(written_keys));
-
+      if (configuration_store::patch(config::sunshine.config_file, updates) != configuration_store::result::committed) return false;
+      std::vector<std::string> keys;
+      for (const auto &[key, value] : updates) keys.push_back(key);
+      settings_metadata::note_config_write("gamestream", std::move(keys));
       return true;
     }
 
@@ -2018,6 +1958,7 @@ namespace nvhttp {
 
       nlohmann::json settings;
       settings["version"] = 1;
+      settings["live_tuning"] = live_tuning::snapshot(stats);
       settings["revision"] = std::to_string(std::hash<std::string> {}(revision_seed));
       settings["desired"] = std::move(desired);
       settings["effective"] = std::move(effective);
@@ -2034,6 +1975,7 @@ namespace nvhttp {
         {"target_bitrate_override", true},
         {"ai_auto_quality_control", false},
         {"adaptive_bitrate_control", true},
+        {"live_tuning_v1", true},
         {"ai_optimizer_control", false},
         {"client_presentation_reporting", true},
         {"optimizer_sync_reporting", true},
@@ -2550,18 +2492,14 @@ namespace nvhttp {
     std::mutex deferred_cage_capability_probe_mutex;
 
     std::optional<std::string> copy_env_var(const char *key) {
-      if (const char *value = getenv(key)) {
-        return std::string {value};
-      }
-
-      return std::nullopt;
+      return process_environment::get(key);
     }
 
     void restore_env_var(const char *key, const std::optional<std::string> &value) {
       if (value) {
         platf::set_env(key, *value);
       } else {
-        unsetenv(key);
+        process_environment::unset(key);
       }
     }
 
@@ -3080,6 +3018,9 @@ namespace nvhttp {
   using PERM = crypto::PERM;
 
   std::optional<pairing_access_preset_t> pairing_access_preset_from_view(std::string_view preset) {
+    if (preset == "gamepad"sv) {
+      return pairing_access_preset_t::gamepad;
+    }
     if (preset == "standard"sv) {
       return pairing_access_preset_t::standard;
     }
@@ -3094,6 +3035,8 @@ namespace nvhttp {
 
   PERM pairing_access_preset_perm(pairing_access_preset_t preset) {
     switch (preset) {
+      case pairing_access_preset_t::gamepad:
+        return PERM::_gamepad_only;
       case pairing_access_preset_t::standard:
         return PERM::_default;
       case pairing_access_preset_t::game_control:
@@ -3106,6 +3049,8 @@ namespace nvhttp {
 
   std::string_view pairing_access_preset_name(pairing_access_preset_t preset) {
     switch (preset) {
+      case pairing_access_preset_t::gamepad:
+        return "gamepad"sv;
       case pairing_access_preset_t::standard:
         return "standard"sv;
       case pairing_access_preset_t::game_control:
@@ -4064,6 +4009,8 @@ namespace nvhttp {
         named_cert_node["paired_at"] = named_cert_p->paired_at;
         named_cert_node["last_seen_at"] = named_cert_p->last_seen_at.load(std::memory_order_relaxed);
         named_cert_node["client_family"] = named_cert_p->client_family;
+        named_cert_node["controller_type"] = named_cert_p->controller_type;
+        named_cert_node["client_reports_hdr10_display"] = named_cert_p->client_reports_hdr10_display;
         named_cert_node["display_mode"] = named_cert_p->display_mode;
         named_cert_node["target_bitrate_kbps"] = named_cert_p->target_bitrate_kbps;
         named_cert_node["perm"] = static_cast<uint32_t>(named_cert_p->perm);
@@ -4113,12 +4060,20 @@ namespace nvhttp {
     std::lock_guard lock(client_state_mutex);
     const std::filesystem::path state_path {config::nvhttp.file_state};
     state_file_lock_t interprocess_lock {state_path};
-    const auto fail_closed = [&](std::string_view reason) {
-      BOOST_LOG(error) << "Refusing authorization state from "sv << state_path << ": "sv << reason;
+    const auto start_unpaired = [&]() {
       clear_authorization_state_locked();
       http::uuid = uuid_util::uuid_t::generate();
       http::unique_id = http::uuid.string();
       return false;
+    };
+    const auto fail_closed = [&](std::string_view reason) {
+      // This reads as fatal and is not: the host carries on with a fresh
+      // identity. A reporter on discussion #637 hit it right after fixing a
+      // directory mode and took it for a new failure.
+      BOOST_LOG(error) << "Refusing authorization state from "sv << state_path << ": "sv << reason
+                       << ". Continuing with a new host identity, so any client paired before "
+                          "now has to pair again."sv;
+      return start_unpaired();
     };
 
     if (!interprocess_lock) {
@@ -4126,10 +4081,7 @@ namespace nvhttp {
     }
     if (!fs::exists(state_path)) {
       BOOST_LOG(info) << "File "sv << state_path << " doesn't exist"sv;
-      clear_authorization_state_locked();
-      http::uuid = uuid_util::uuid_t::generate();
-      http::unique_id = http::uuid.string();
-      return false;
+      return start_unpaired();
     }
 
     try {
@@ -4139,7 +4091,22 @@ namespace nvhttp {
         return fail_closed("couldn't open the file");
       }
       input >> tree;
-      if (!tree.is_object() || !tree.contains("root") || !tree["root"].is_object()) {
+      if (!tree.is_object()) {
+        return fail_closed("the file does not hold a JSON object");
+      }
+      if (!tree.contains("root")) {
+        // The web credentials live in this same file (config.cpp points
+        // credentials_file at file_state), and pairing is the only writer that
+        // ever creates "root". Setting a password on a fresh install therefore
+        // leaves a state file with no "root" in it at all. That is a host that
+        // has not paired anything yet, not a damaged file. Reporting it as
+        // damage on every start sends its owner looking for corruption that is
+        // not there.
+        BOOST_LOG(info) << "No client has paired with this host yet, so "sv << state_path
+                        << " holds no pairing state"sv;
+        return start_unpaired();
+      }
+      if (!tree["root"].is_object()) {
         return fail_closed("root must be an object");
       }
 
@@ -4220,6 +4187,8 @@ namespace nvhttp {
           named_cert->last_seen_at.store(last_seen_at, std::memory_order_relaxed);
           named_cert->last_seen_persisted_at.store(last_seen_at, std::memory_order_relaxed);
           named_cert->client_family = entry.value("client_family", "");
+          named_cert->controller_type = entry.value("controller_type", 0);
+          named_cert->client_reports_hdr10_display = entry.value("client_reports_hdr10_display", false);
           named_cert->display_mode = entry.value("display_mode", "");
           named_cert->target_bitrate_kbps = util::get_non_string_json_value<int>(entry, "target_bitrate_kbps", 0);
           named_cert->perm = (PERM)(util::get_non_string_json_value<uint32_t>(entry, "perm", (uint32_t)PERM::_all)) & PERM::_all;
@@ -4265,6 +4234,8 @@ namespace nvhttp {
     clone->uuid = source->uuid;
     clone->cert = source->cert;
     clone->client_family = source->client_family;
+    clone->controller_type = source->controller_type;
+    clone->client_reports_hdr10_display = source->client_reports_hdr10_display;
     clone->display_mode = source->display_mode;
     clone->target_bitrate_kbps = source->target_bitrate_kbps;
     clone->paired_at = source->paired_at;
@@ -4477,6 +4448,8 @@ namespace nvhttp {
     launch_session->requested_fps = launch_session->fps;
 
     launch_session->device_name = named_cert_p->name.empty() ? "PolarisDisplay"s : named_cert_p->name;
+    launch_session->controller_type = named_cert_p->controller_type;
+    launch_session->client_reports_hdr10_display = named_cert_p->client_reports_hdr10_display;
     launch_session->unique_id = named_cert_p->uuid;
     launch_session->temporary_authorization = named_cert_p->temporary_authorization;
     launch_session->profile_preference = launch_profile::normalize_preset(
@@ -4994,6 +4967,25 @@ namespace nvhttp {
     }
     rebuild_cert_chain_locked();
     return replacement;
+  }
+
+  int publish_authorized_launch(const crypto::p_named_cert_t &candidate,
+                                crypto::PERM required_permission,
+                                const std::function<bool()> &publish) {
+    std::lock_guard lock(client_state_mutex);
+    const auto current = resolve_authorized_client(candidate);
+    if (!current) {
+      return 401;
+    }
+    if (!(current->perm & required_permission)) {
+      return 403;
+    }
+    // Client records are immutable. A replacement may change launch commands,
+    // guest status, display locks or permissions: resolve a fresh request.
+    if (current != candidate) {
+      return 409;
+    }
+    return publish() ? 0 : 409;
   }
 
   inline crypto::p_named_cert_t get_verified_cert(
@@ -6160,7 +6152,7 @@ namespace nvhttp {
                              << launch_policy.physicalDisplayRisk;
           tree.put("root.resume", 0);
           tree.put("root.<xmlattr>.status_code", 409);
-          tree.put("root.<xmlattr>.status_message", "Unsafe private stream launch refused because desktop Steam or a desktop game is active. Quit the desktop session or retry with explicit desktop mirroring.");
+          tree.put("root.<xmlattr>.status_message", "Unsafe private stream launch refused because desktop Steam or a desktop game is active. Quit it on the host, or turn on \"Close desktop Steam for private launches\" for this app so Polaris closes it for you, or retry with explicit desktop mirroring.");
           tree.put("root.error_code", "desktop_active_private_stream_refused");
           tree.put("root.gamesession", 0);
           return;
@@ -6183,15 +6175,21 @@ namespace nvhttp {
           }
         } catch (...) {}
 
-        auto err = proc::proc.execute_and_raise(*app_iter, launch_session);
+        auto err = proc::proc.execute_and_raise(*app_iter, launch_session, [&]() {
+          return publish_authorized_launch(named_cert_p, perm, [&]() {
+            return proc::proc.raise_session_for_admitted_launch(launch_session);
+          });
+        });
         launch_session_raised = err == 0;
         if (err) {
           tree.put("root.<xmlattr>.status_code", err);
           tree.put(
             "root.<xmlattr>.status_message",
             err == 503
-            ? "Failed to initialize video capture/encoding. Is a display connected and turned on?"
-            : "Failed to start the specified application");
+            ? "Video capture or encoding could not start. If prompted, approve screen sharing on the host."
+            : (err == 401 || err == 403 || err == 409)
+              ? "Authorization or session state changed during launch; reconnect to retry"
+              : "Failed to start the specified application");
           tree.put("root.gamesession", 0);
 
           return;
@@ -6203,10 +6201,23 @@ namespace nvhttp {
       tree.put("root.gamesession", 0);
     }
 
-    if (!launch_session_raised && !proc::proc.raise_session_for_admitted_launch(launch_session)) {
+    if (!launch_session_raised) {
+      if (const auto capture_error = proc::proc.prepare_capture_for_admitted_launch(launch_session)) {
+        tree.put("root.gamesession", 0);
+        tree.put("root.<xmlattr>.status_code", capture_error);
+        tree.put("root.<xmlattr>.status_message", "Desktop screen sharing was cancelled or capture could not be prepared");
+        return;
+      }
+    }
+    const auto publish_error = launch_session_raised ? 0 :
+      publish_authorized_launch(named_cert_p, perm, [&]() {
+        return proc::proc.raise_session_for_admitted_launch(launch_session);
+      });
+    if (publish_error) {
+      launch_session->cancel();
       tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 409);
-      tree.put("root.<xmlattr>.status_message", "Another launch is already pending");
+      tree.put("root.<xmlattr>.status_code", publish_error);
+      tree.put("root.<xmlattr>.status_message", "Authorization or session state changed during launch; reconnect to retry");
       return;
     }
 #ifdef __linux__
@@ -6457,10 +6468,19 @@ namespace nvhttp {
     }
 #endif
 
-    if (!proc::proc.raise_session_for_admitted_launch(launch_session)) {
+    if (const auto capture_error = proc::proc.prepare_capture_for_admitted_launch(launch_session)) {
       tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 409);
-      tree.put("root.<xmlattr>.status_message", "Another launch is already pending");
+      tree.put("root.<xmlattr>.status_code", capture_error);
+      tree.put("root.<xmlattr>.status_message", "Desktop screen sharing was cancelled or capture could not be prepared");
+      return;
+    }
+    if (const auto publish_error = publish_authorized_launch(named_cert_p, PERM::_allow_view, [&]() {
+          return proc::proc.raise_session_for_admitted_launch(launch_session);
+        })) {
+      launch_session->cancel();
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", publish_error);
+      tree.put("root.<xmlattr>.status_message", "Authorization or session state changed during resume; reconnect to retry");
       return;
     }
 #ifdef __linux__
@@ -6525,6 +6545,8 @@ namespace nvhttp {
     }
 
     const auto session_token = get_arg(args, "sessiontoken", "");
+    auto pending_capture_cancel = proc::proc.cancel_capture_preparation_for_shutdown(
+      named_cert_p->uuid, session_token, true, false);
     // Paired cert UUID is the owner identity. Never require sessiontoken for the
     // owner — Artemis/Moonlight often send a stale token and map any cancel
     // failure to "started by another device".
@@ -6853,6 +6875,7 @@ namespace nvhttp {
       // Kept as explicit false for older clients. AI may explain evidence but
       // cannot own launch settings in this contract.
       features["ai_auto_quality"] = false;
+      features["live_tuning_v1"] = true;
       features["ai_auto_quality_control"] = false;
       features["ai_optimizer"] = false;
       features["ai_optimizer_control"] = false;
@@ -6994,6 +7017,7 @@ namespace nvhttp {
       const bool owned_by_client = stop_snapshot.owned_by_client;
       const bool stop_in_progress = stop_snapshot.stop_in_progress;
       output["state"] = session_state;
+      output["events_https_port"] = net::map_port(confighttp::PORT_HTTPS);
       output["streaming_active"] = stats.streaming;
       output["shutdown_requested"] = stop_in_progress;
       auto &build = output["build"];
@@ -7300,6 +7324,7 @@ namespace nvhttp {
         "Deprecated recovery record; it cannot affect launch and may be cancelled." :
         "Deprecated recovery record; it cannot affect launch.";
       output["auto_quality"] = health.value("recovery_policy", nlohmann::json::object());
+      output["live_tuning"] = live_tuning::snapshot(stats);
       output["profile_state"] = build_live_profile_state_json(
         health,
         output["auto_quality"],
@@ -7527,6 +7552,7 @@ namespace nvhttp {
             return;
           }
 
+          std::unique_lock configuration_guard(configuration_store::mutex());
           std::optional<std::string> stream_display_mode;
           if (body.contains("stream_display_mode")) {
             const auto reject_stream_display_mode = [&](const std::string &message) {
@@ -7616,16 +7642,11 @@ namespace nvhttp {
               return;
             }
             const bool enabled = body["adaptive_bitrate_enabled"].get<bool>();
-            if (!persist_config_values({{"adaptive_bitrate_enabled", bool_config_value(enabled)}})) {
-              write_json({{"error", "failed to persist adaptive bitrate setting"}}, SimpleWeb::StatusCode::server_error_internal_server_error);
-              return;
-            }
-            if (!global_control_guard.set_adaptive_enabled(enabled)) {
-              write_json(
-                {{"status", false}, {"changed", false}, {"state", "scope_mismatch"},
-                 {"error", "The active stream generation changed before adaptive bitrate could be updated."}},
-                SimpleWeb::StatusCode::client_error_conflict
-              );
+            const auto expected = body.contains("configuration_revision") ?
+              std::optional<std::string>(body.at("configuration_revision").get<std::string>()) : std::nullopt;
+            const auto result = live_tuning::set_enabled(global_control_guard, enabled, expected);
+            if (!result.value("status", false)) {
+              write_json(result, static_cast<SimpleWeb::StatusCode>(result.value("http_status", 500)));
               return;
             }
           }
@@ -7665,6 +7686,15 @@ namespace nvhttp {
               write_json({{"error", error}}, SimpleWeb::StatusCode::client_error_bad_request);
               return;
             }
+            // The client just told us what its own panel can do. Keep it, so the answer outlives
+            // this process and the next launch does not fall back to an uncorrected record.
+            if (const auto capabilities = body.value("device_capabilities", nlohmann::json::object());
+                capabilities.is_object()) {
+              remember_client_hdr10_display(
+                named_cert_p->uuid,
+                capabilities.value("supports_hdr10_display", false)
+              );
+            }
           }
 
           if (stream_display_mode) {
@@ -7695,6 +7725,7 @@ namespace nvhttp {
           // lifecycle lock used by final resolution and generation install.
           // Per-client durable settings and separately owner-gated live
           // bitrate follow.
+          configuration_guard.unlock();
           global_control_guard.release();
           if (topology_lifecycle_guard.owns_lock()) {
             topology_lifecycle_guard.unlock();
@@ -7727,7 +7758,7 @@ namespace nvhttp {
             }
             paired_device_updated = true;
           }
-          if (target_bitrate_kbps > 0) {
+          if (body.contains("target_bitrate_kbps") && target_bitrate_kbps > 0) {
             // A paired client setting is an explicit newer operator choice.
             // Apply it exactly to the live target instead of preserving an
             // older Doctor/adaptive reduction beneath the new base.
@@ -8511,7 +8542,7 @@ namespace nvhttp {
                              << " physical_display_risk="sv
                              << launch_policy.physicalDisplayRisk;
           nlohmann::json err;
-          err["error"] = "Unsafe private stream launch refused because desktop Steam or a desktop game is active. Quit the desktop session or retry with explicit desktop mirroring.";
+          err["error"] = "Unsafe private stream launch refused because desktop Steam or a desktop game is active. Quit it on the host, or turn on \"Close desktop Steam for private launches\" for this app so Polaris closes it for you, or retry with explicit desktop mirroring.";
           err["error_code"] = "desktop_active_private_stream_refused";
           err["launchPolicy"] = launch_policy_json;
           SimpleWeb::CaseInsensitiveMultimap headers;
@@ -9361,30 +9392,20 @@ namespace nvhttp {
           response->write(SimpleWeb::StatusCode::client_error_forbidden, err.dump(), headers);
           return;
         }
-        if (!persist_config_values({
-              {"adaptive_bitrate_enabled", bool_config_value(enabled)}
-            })) {
-          nlohmann::json err;
-          err["error"] = "failed to persist adaptive bitrate setting";
+        const auto expected = body.contains("configuration_revision") ?
+          std::optional<std::string>(body.at("configuration_revision").get<std::string>()) : std::nullopt;
+        const auto result = live_tuning::set_enabled(global_control_guard, enabled, expected);
+        if (!result.value("status", false)) {
           SimpleWeb::CaseInsensitiveMultimap headers;
           headers.emplace("Content-Type", "application/json");
-          response->write(SimpleWeb::StatusCode::server_error_internal_server_error, err.dump(), headers);
-          return;
-        }
-        if (!global_control_guard.set_adaptive_enabled(enabled)) {
-          nlohmann::json err {
-            {"status", false}, {"changed", false}, {"state", "scope_mismatch"},
-            {"error", "The active stream generation changed before adaptive bitrate could be updated."}
-          };
-          SimpleWeb::CaseInsensitiveMultimap headers;
-          headers.emplace("Content-Type", "application/json");
-          response->write(SimpleWeb::StatusCode::client_error_conflict, err.dump(), headers);
+          response->write(static_cast<SimpleWeb::StatusCode>(result.value("http_status", 500)), result.dump(), headers);
           return;
         }
         BOOST_LOG(info) << "Adaptive bitrate toggled: " << (enabled ? "enabled" : "disabled");
 
         nlohmann::json output;
         output["status"] = true;
+        output["live_tuning"] = result["live_tuning"];
         output["ai_auto_quality_enabled"] = false;
         output["adaptive_bitrate_enabled"] = adaptive_bitrate::is_enabled();
         output["ai_optimizer_enabled"] = false;
@@ -9926,7 +9947,8 @@ namespace nvhttp {
         requested_selection == stream_display_policy::k_host_virtual_display,
         app_virtual_display,
         topology_locked || paired_virtual_lock,
-        false
+        false,
+        stream_display_policy::host_default_provides_private_display()
       );
       if (!mirror_desktop && !requested_selection.empty()) {
         if (effective_selection == requested_selection) {
@@ -9954,7 +9976,9 @@ namespace nvhttp {
         }
       }
       if (effective_selection.empty()) {
-        effective_selection = stream_display_policy::configured_selection();
+        // The host default, so a paused session's topology is not echoed back
+        // to this client as the topology it should then assert on /launch.
+        effective_selection = stream_display_policy::host_default_selection();
       }
       if (!effective_selection.empty()) {
         std::string topology_reject_reason;
@@ -10427,6 +10451,7 @@ namespace nvhttp {
     const bool always_use_virtual_display,
     const std::optional<bool> temporary_authorization
   ) {
+    std::shared_ptr<rtsp_stream::launch_session_t> cancelled_launch;
     {
       std::lock_guard lock(client_state_mutex);
       const auto it = std::find_if(
@@ -10456,8 +10481,10 @@ namespace nvhttp {
         return client_mutation_result_t::persistence_failed;
       }
       rebuild_cert_chain_locked();
+      cancelled_launch = rtsp_stream::take_pending_launch_for_client(uuid);
     }
 
+    rtsp_stream::finish_cancelled_launch(cancelled_launch);
     find_and_udpate_session_info(uuid, name, newPerm);
     return client_mutation_result_t::success;
   }
@@ -10491,17 +10518,79 @@ namespace nvhttp {
   }
 
   bool expire_temporary_client_authorization(const std::string_view uuid) {
-    std::lock_guard lock(client_state_mutex);
-    const auto before = client_root.named_devices.size();
-    std::erase_if(client_root.named_devices, [&](const crypto::p_named_cert_t &client) {
-      return client->uuid == uuid && client->temporary_authorization;
-    });
-    if (client_root.named_devices.size() == before) {
+    std::shared_ptr<rtsp_stream::launch_session_t> cancelled_launch;
+    {
+      std::lock_guard lock(client_state_mutex);
+      const auto before = client_root.named_devices.size();
+      std::erase_if(client_root.named_devices, [&](const crypto::p_named_cert_t &client) {
+        return client->uuid == uuid && client->temporary_authorization;
+      });
+      if (client_root.named_devices.size() == before) {
+        return false;
+      }
+      rebuild_cert_chain_locked();
+      cancelled_launch = rtsp_stream::take_pending_launch_for_client(uuid);
+    }
+    BOOST_LOG(info) << "Expired temporary authorization for client ["sv << uuid << ']';
+    rtsp_stream::finish_cancelled_launch(cancelled_launch);
+    return true;
+  }
+
+  bool remember_client_controller_type(const std::string_view uuid, const int controller_type) {
+    if (controller_type == 0) {
       return false;
     }
+    {
+      std::lock_guard lock(client_state_mutex);
+      const auto client = std::find_if(
+        client_root.named_devices.begin(),
+        client_root.named_devices.end(),
+        [&](const crypto::p_named_cert_t &candidate) {
+          return candidate->uuid == uuid;
+        }
+      );
+      if (client == client_root.named_devices.end() ||
+          (*client)->controller_type == controller_type) {
+        return false;
+      }
+      (*client)->controller_type = controller_type;
+      if (!save_state()) {
+        return false;
+      }
+    }
+    BOOST_LOG(info) << "Remembered controller type ["sv << controller_type
+                    << "] for client ["sv << uuid
+                    << "]; the pad created before the next launch will match it"sv;
+    return true;
+  }
 
-    rebuild_cert_chain_locked();
-    BOOST_LOG(info) << "Expired temporary authorization for client ["sv << uuid << ']';
+  bool remember_client_hdr10_display(const std::string_view uuid, const bool supports_hdr10_display) {
+    if (!supports_hdr10_display) {
+      // A client that says no, or says nothing, must not clear a capability already observed.
+      // Nova reports false for an external display it cannot inspect, among other things.
+      return false;
+    }
+    {
+      std::lock_guard lock(client_state_mutex);
+      const auto client = std::find_if(
+        client_root.named_devices.begin(),
+        client_root.named_devices.end(),
+        [&](const crypto::p_named_cert_t &candidate) {
+          return candidate->uuid == uuid;
+        }
+      );
+      if (client == client_root.named_devices.end() ||
+          (*client)->client_reports_hdr10_display) {
+        return false;
+      }
+      (*client)->client_reports_hdr10_display = true;
+      if (!save_state()) {
+        return false;
+      }
+    }
+    BOOST_LOG(info) << "Client ["sv << uuid
+                    << "] reported an HDR10-capable display; it will no longer be refused HDR "
+                       "because of an uncorrected device record"sv;
     return true;
   }
 
@@ -10521,6 +10610,7 @@ namespace nvhttp {
   client_mutation_result_t unpair_client_result(const std::string_view uuid) {
     bool no_clients_remain = false;
     bool removed_temporary_authorization = false;
+    std::shared_ptr<rtsp_stream::launch_session_t> cancelled_launch;
     {
       std::lock_guard lock(client_state_mutex);
       auto previous_clients = client_root.named_devices;
@@ -10540,8 +10630,10 @@ namespace nvhttp {
       }
       rebuild_cert_chain_locked();
       no_clients_remain = client_root.named_devices.empty();
+      cancelled_launch = rtsp_stream::take_pending_launch_for_client(uuid);
     }
 
+    rtsp_stream::finish_cancelled_launch(cancelled_launch);
     if (auto session = rtsp_stream::find_session(std::string(uuid))) {
       stop_session(*session, true);
     }

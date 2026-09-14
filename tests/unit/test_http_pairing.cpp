@@ -22,10 +22,18 @@
   #include <unistd.h>
 #endif
 
+#include <boost/core/null_deleter.hpp>
+#include <boost/log/core.hpp>
+#include <boost/log/sinks/sync_frontend.hpp>
+#include <boost/log/sinks/text_ostream_backend.hpp>
+#include <boost/smart_ptr/make_shared_object.hpp>
+#include <boost/smart_ptr/shared_ptr.hpp>
+
 #include <src/crypto.h>
 #include <src/config.h>
 #include <src/httpcommon.h>
 #include <src/nvhttp.h>
+#include <src/rtsp.h>
 
 using namespace nvhttp;
 using namespace std::literals;
@@ -609,6 +617,24 @@ TEST_F(PairingAccessPresetTest, ParsesAccessPresets) {
   );
   EXPECT_EQ(pairing_access_preset_name(*game_control), "game_control"sv);
 
+  const auto gamepad = pairing_access_preset_from_view("gamepad");
+  ASSERT_TRUE(gamepad);
+  EXPECT_EQ(pairing_access_preset_perm(*gamepad), crypto::PERM::_gamepad_only);
+  EXPECT_EQ(pairing_access_preset_name(*gamepad), "gamepad"sv);
+  // Watching and a controller, nothing else. This is the whole preset, so pin every half of it.
+  EXPECT_EQ(
+    static_cast<uint32_t>(pairing_access_preset_perm(*gamepad) & crypto::PERM::_all_inputs),
+    static_cast<uint32_t>(crypto::PERM::input_controller)
+  );
+  EXPECT_EQ(
+    static_cast<uint32_t>(pairing_access_preset_perm(*gamepad) & crypto::PERM::_all_actions),
+    static_cast<uint32_t>(crypto::PERM::view)
+  );
+  EXPECT_EQ(
+    static_cast<uint32_t>(pairing_access_preset_perm(*gamepad) & crypto::PERM::_all_opeiations),
+    0U
+  );
+
   const auto full = pairing_access_preset_from_view("full");
   ASSERT_TRUE(full);
   EXPECT_EQ(pairing_access_preset_perm(*full), crypto::PERM::_all);
@@ -644,6 +670,44 @@ TEST_F(PairingAccessPresetTest, RepairingSameCertificateReplacesAuthorizationWit
   EXPECT_EQ(clients[0]["name"], "test-duplicate-replacement");
   EXPECT_EQ(clients[0]["perm"].get<uint32_t>(), static_cast<uint32_t>(crypto::PERM::_game_control));
   EXPECT_EQ(clients[0]["paired_at"].get<std::int64_t>(), original_paired_at);
+}
+
+TEST_F(PairingAccessPresetTest, RemembersTheControllerTypeAClientDeclared) {
+  // The pad is created before the app launches, which is before the client can say what it
+  // wants, so the only way to start the right one is to remember the last answer.
+  auto client = std::make_shared<crypto::named_cert_t>();
+  client->cert = PUBLIC_CERT;
+  client->name = "pad-memory";
+  client->uuid = uuid_util::uuid_t::generate().string();
+  ASSERT_TRUE(add_authorized_client_for_tests(client));
+
+  // Nothing observed yet is the honest state of a device that has never streamed.
+  EXPECT_FALSE(remember_client_controller_type(client->uuid, 0));
+
+  EXPECT_TRUE(remember_client_controller_type(client->uuid, LI_CTYPE_PS));
+  // Writing the same answer again must not churn the state file on every disconnect.
+  EXPECT_FALSE(remember_client_controller_type(client->uuid, LI_CTYPE_PS));
+  EXPECT_TRUE(remember_client_controller_type(client->uuid, LI_CTYPE_XBOX));
+
+  EXPECT_FALSE(remember_client_controller_type(uuid_util::uuid_t::generate().string(), LI_CTYPE_PS));
+}
+
+TEST_F(PairingAccessPresetTest, RemembersThatAClientReportedAnHdr10Display) {
+  auto client = std::make_shared<crypto::named_cert_t>();
+  client->cert = PUBLIC_CERT;
+  client->name = "hdr-memory";
+  client->uuid = uuid_util::uuid_t::generate().string();
+  ASSERT_TRUE(add_authorized_client_for_tests(client));
+
+  EXPECT_TRUE(remember_client_hdr10_display(client->uuid, true));
+  // Writing the same answer again must not churn the state file on every report.
+  EXPECT_FALSE(remember_client_hdr10_display(client->uuid, true));
+  // A later false must not erase what was already observed: Nova reports false for an external
+  // display it cannot inspect, and that is not evidence the panel lost HDR.
+  EXPECT_FALSE(remember_client_hdr10_display(client->uuid, false));
+  EXPECT_FALSE(remember_client_hdr10_display(client->uuid, true));
+
+  EXPECT_FALSE(remember_client_hdr10_display(uuid_util::uuid_t::generate().string(), true));
 }
 
 TEST_F(PairingAccessPresetTest, CanonicallyEquivalentCertificateReplacesAuthorization) {
@@ -730,6 +794,129 @@ TEST_F(PairingAccessPresetTest, ConcurrentRevocationRejectsEstablishedAuthorizat
   EXPECT_EQ(stale_authorizations.load(), 0);
 }
 
+TEST_F(PairingAccessPresetTest, RevocationDuringInteractiveLaunchRejectsPublicationWithAnotherClientPaired) {
+  TemporaryPairingState state {"interactive-revocation"};
+  auto first = std::make_shared<crypto::named_cert_t>();
+  first->uuid = "interactive-first";
+  first->cert = PUBLIC_CERT;
+  first->temporary_authorization = true;
+  ASSERT_TRUE(add_authorized_client_for_tests(first, crypto::PERM::_all));
+  auto second = std::make_shared<crypto::named_cert_t>();
+  second->uuid = "interactive-second";
+  second->cert = crypto::gen_creds("Second launch client", 2048).x509;
+  second->temporary_authorization = true;
+  ASSERT_TRUE(add_authorized_client_for_tests(second, crypto::PERM::_all));
+  const auto snapshot = resolve_authorized_client(first);
+  ASSERT_TRUE(snapshot);
+
+  std::promise<void> prompt_started, approve;
+  auto approval = approve.get_future();
+  std::atomic<int> publications {0};
+  auto request = std::async(std::launch::async, [&]() {
+    prompt_started.set_value();
+    approval.wait();
+    return publish_authorized_launch(snapshot, crypto::PERM::launch, [&]() {
+      ++publications;
+      return true;
+    });
+  });
+  prompt_started.get_future().wait();
+  EXPECT_EQ(unpair_client_result(first->uuid), client_mutation_result_t::success);
+  approve.set_value();
+  EXPECT_EQ(request.get(), 401);
+  EXPECT_EQ(publications.load(), 0);
+  EXPECT_TRUE(resolve_authorized_client(second));
+}
+
+TEST_F(PairingAccessPresetTest, LaunchPublicationRejectsChangedPermissionsAndGuestExpiration) {
+  TemporaryPairingState state {"interactive-policy-change"};
+  auto client = std::make_shared<crypto::named_cert_t>();
+  client->uuid = "interactive-policy";
+  client->cert = PUBLIC_CERT;
+  client->temporary_authorization = true;
+  ASSERT_TRUE(add_authorized_client_for_tests(client, crypto::PERM::_all));
+  const auto snapshot = resolve_authorized_client(client);
+  ASSERT_TRUE(snapshot);
+  int publications = 0;
+  const auto publish = [&]() { ++publications; return true; };
+  EXPECT_EQ(publish_authorized_launch(snapshot, crypto::PERM::launch, publish), 0);
+  auto changed = std::make_shared<crypto::named_cert_t>();
+  changed->uuid = client->uuid;
+  changed->cert = with_crlf_line_endings(PUBLIC_CERT);
+  changed->temporary_authorization = true;
+  ASSERT_TRUE(add_authorized_client_for_tests(changed, crypto::PERM::_default));
+  EXPECT_EQ(publish_authorized_launch(snapshot, crypto::PERM::launch, publish), 403);
+  EXPECT_EQ(publish_authorized_launch(snapshot, crypto::PERM::_allow_view, publish), 409);
+  const auto current = resolve_authorized_client(changed);
+  ASSERT_TRUE(current);
+  EXPECT_EQ(publish_authorized_launch(current, crypto::PERM::_allow_view, publish), 0);
+  EXPECT_TRUE(expire_temporary_client_authorization(current->uuid));
+  EXPECT_EQ(publish_authorized_launch(current, crypto::PERM::_allow_view, publish), 401);
+  EXPECT_EQ(publications, 2);
+}
+
+TEST_F(PairingAccessPresetTest, RevocationAfterPublicationCancelsOnlyThatPendingLaunch) {
+  TemporaryPairingState state {"pending-launch-revocation"};
+  auto client = std::make_shared<crypto::named_cert_t>();
+  client->uuid = "pending-guest";
+  client->cert = PUBLIC_CERT;
+  client->temporary_authorization = true;
+  ASSERT_TRUE(add_authorized_client_for_tests(client, crypto::PERM::_all));
+  const auto snapshot = resolve_authorized_client(client);
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  launch->id = 62801;
+  launch->unique_id = client->uuid;
+  std::weak_ptr<void> preparation;
+  {
+    auto lease = std::make_shared<int>(1);
+    preparation = lease;
+    launch->capture_preparation.store(lease);
+  }
+  ASSERT_EQ(publish_authorized_launch(snapshot, crypto::PERM::launch, [&]() {
+    return rtsp_stream::launch_session_raise(launch);
+  }), 0);
+  rtsp_stream::cancel_pending_launch_for_client("another-client");
+  EXPECT_FALSE(launch->is_cancelled());
+  EXPECT_FALSE(preparation.expired());
+  EXPECT_TRUE(expire_temporary_client_authorization(client->uuid));
+  EXPECT_TRUE(launch->is_cancelled());
+  EXPECT_TRUE(preparation.expired());
+  EXPECT_EQ(rtsp_stream::session_snapshot(client->uuid).pending_sessions, 0);
+}
+
+TEST_F(PairingAccessPresetTest, PublicationAndGuestRevocationShareOneCommitBoundary) {
+  auto client = std::make_shared<crypto::named_cert_t>();
+  client->uuid = "serialized-guest";
+  client->cert = PUBLIC_CERT;
+  client->temporary_authorization = true;
+  ASSERT_TRUE(add_authorized_client_for_tests(client, crypto::PERM::_all));
+  const auto snapshot = resolve_authorized_client(client);
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  launch->id = 62802;
+  launch->unique_id = client->uuid;
+  std::promise<void> publishing, release, revoking;
+  auto release_publication = release.get_future().share();
+  auto request = std::async(std::launch::async, [&]() {
+    return publish_authorized_launch(snapshot, crypto::PERM::launch, [&]() {
+      publishing.set_value();
+      release_publication.wait();
+      return rtsp_stream::launch_session_raise(launch);
+    });
+  });
+  publishing.get_future().wait();
+  auto mutation = std::async(std::launch::async, [&]() {
+    revoking.set_value();
+    return expire_temporary_client_authorization(client->uuid);
+  });
+  revoking.get_future().wait();
+  EXPECT_EQ(mutation.wait_for(20ms), std::future_status::timeout);
+  release.set_value();
+  EXPECT_EQ(request.get(), 0);
+  EXPECT_TRUE(mutation.get());
+  EXPECT_TRUE(launch->is_cancelled());
+  EXPECT_EQ(rtsp_stream::session_snapshot(client->uuid).pending_sessions, 0);
+}
+
 TEST_F(PairingAccessPresetTest, SameUuidDifferentCertificateRejectsEstablishedRequestSnapshot) {
   TemporaryPairingState state {"same-uuid-different-certificate"};
   auto original = std::make_shared<crypto::named_cert_t>();
@@ -782,7 +969,7 @@ TEST_F(PairingAccessPresetTest, ParsedPolarisPathPersistsNovaClientFamily) {
 }
 
 TEST_F(PairingAccessPresetTest, PolarisMutationHandlersRenderTheCommittedLiveClient) {
-  const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path() / "src/nvhttp.cpp";
+  const auto source_path = std::filesystem::path(POLARIS_SOURCE_DIR) / "src/nvhttp.cpp";
   std::ifstream source_stream(source_path);
   ASSERT_TRUE(source_stream.is_open());
   const std::string source {
@@ -2057,4 +2244,98 @@ TEST_F(PairingHttpHandlerTest, TrustedNetworkHandlerStillRequiresClientOptIn) {
   ASSERT_FALSE(id.empty());
   EXPECT_TRUE(cancel_pairing(id));
   EXPECT_NE(response.get().find("cancelled by operator"), std::string::npos);
+}
+
+// Reads back what an operator would see, because the whole point of these
+// messages is the person in the terminal.
+class pairing_log_capture_t {
+public:
+  pairing_log_capture_t():
+      stream_ {boost::make_shared<std::ostringstream>()} {
+    auto backend = boost::make_shared<boost::log::sinks::text_ostream_backend>();
+    backend->add_stream(boost::shared_ptr<std::ostream> {stream_.get(), boost::null_deleter {}});
+    backend->auto_flush(true);
+    sink_ = boost::make_shared<sink_t>(backend);
+    boost::log::core::get()->add_sink(sink_);
+  }
+
+  ~pairing_log_capture_t() {
+    boost::log::core::get()->remove_sink(sink_);
+  }
+
+  pairing_log_capture_t(const pairing_log_capture_t &) = delete;
+  pairing_log_capture_t &operator=(const pairing_log_capture_t &) = delete;
+
+  [[nodiscard]] std::string text() const {
+    return stream_->str();
+  }
+
+private:
+  using sink_t = boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>;
+  boost::shared_ptr<std::ostringstream> stream_;
+  boost::shared_ptr<sink_t> sink_;
+};
+
+// The web credentials and the pairing state share one file, and pairing is the
+// only writer that ever creates "root". A host that has been given a password
+// but has never paired a client therefore has a state file with no "root" in
+// it at all. That is the ordinary shape of a fresh install, not damage, and it
+// must not be reported as lost pairings on every start.
+TEST_F(PairingAccessPresetTest, CredentialsWrittenBeforeAnyPairingAreNotDamage) {
+  TemporaryPairingState state {"credentials-before-pairing"};
+  ASSERT_EQ(http::save_user_creds(state.path.string(), "operator", "test-password"), 0);
+  const auto persisted = state.read();
+  ASSERT_TRUE(persisted.is_object());
+  ASSERT_TRUE(persisted.contains("username"));
+  ASSERT_FALSE(persisted.contains("root"));
+
+  reset_pairing_state_for_tests();
+  std::string logged;
+  {
+    pairing_log_capture_t log;
+    load_pairing_state_for_tests();
+    logged = log.text();
+  }
+
+  EXPECT_EQ(logged.find("Refusing authorization state"), std::string::npos) << logged;
+  EXPECT_EQ(logged.find("has to pair again"), std::string::npos) << logged;
+  EXPECT_TRUE(get_all_clients().empty());
+  EXPECT_EQ(state.read()["username"].get<std::string>(), "operator");
+}
+
+// Damage is still damage: a "root" of the wrong type is a broken file and has
+// to keep failing closed.
+TEST_F(PairingAccessPresetTest, PairingStateWithAMalformedRootIsStillRefused) {
+  TemporaryPairingState state {"malformed-pairing-root"};
+  state.write(nlohmann::json {{"username", "operator"}, {"root", 5}});
+
+  reset_pairing_state_for_tests();
+  std::string logged;
+  {
+    pairing_log_capture_t log;
+    load_pairing_state_for_tests();
+    logged = log.text();
+  }
+
+  EXPECT_NE(logged.find("Refusing authorization state"), std::string::npos) << logged;
+  EXPECT_NE(logged.find("root must be an object"), std::string::npos) << logged;
+}
+
+// A file that is not a JSON object at all is broken in a different way, and
+// saying "root must be an object" about it sends the reader looking for a key
+// that could not have been there.
+TEST_F(PairingAccessPresetTest, PairingStateThatIsNotAnObjectSaysSo) {
+  TemporaryPairingState state {"non-object-pairing-state"};
+  state.write(nlohmann::json::array({1, 2, 3}));
+
+  reset_pairing_state_for_tests();
+  std::string logged;
+  {
+    pairing_log_capture_t log;
+    load_pairing_state_for_tests();
+    logged = log.text();
+  }
+
+  EXPECT_NE(logged.find("Refusing authorization state"), std::string::npos) << logged;
+  EXPECT_EQ(logged.find("root must be an object"), std::string::npos) << logged;
 }

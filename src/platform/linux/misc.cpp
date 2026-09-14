@@ -9,6 +9,9 @@
 #endif
 
 // standard includes
+#include "process_environment.h"
+#include "src/verified_action.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -60,6 +63,7 @@
 #include "src/entry_handler.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/platform/send_wait.h"
 #include "src/video.h"
 #include "vaapi.h"
 #include "virtual_display.h"
@@ -90,9 +94,10 @@ namespace {
 
 #ifdef POLARIS_BUILD_VULKAN
   void append_environment_token(const char *name, std::string_view token) {
+    std::lock_guard environment_lock(process_environment::mutex);
     const char *existing = std::getenv(name);
     if (!existing || !*existing) {
-      setenv(name, std::string {token}.c_str(), 1);
+      process_environment::set(name, std::string {token}.c_str(), 1);
       return;
     }
 
@@ -112,7 +117,7 @@ namespace {
       start = end + 1;
     }
 
-    setenv(name, (current + ',' + std::string {token}).c_str(), 1);
+    process_environment::set(name, (current + ',' + std::string {token}).c_str(), 1);
   }
 #endif
 
@@ -922,11 +927,11 @@ std::string get_local_ip_for_gateway() {
   }
 
   int set_env(const std::string &name, const std::string &value) {
-    return setenv(name.c_str(), value.c_str(), 1);
+    return process_environment::set(name.c_str(), value.c_str(), 1);
   }
 
   int unset_env(const std::string &name) {
-    return unsetenv(name.c_str());
+    return process_environment::unset(name.c_str());
   }
 
   bool request_process_group_exit(std::uintptr_t native_handle) {
@@ -969,6 +974,7 @@ std::string get_local_ip_for_gateway() {
   }
 
   bool send_batch(batched_send_info_t &send_info) {
+    if (send_info.cancelled()) return false;
     auto sockfd = (int) send_info.native_socket;
     struct msghdr msg = {};
 
@@ -1038,6 +1044,7 @@ std::string get_local_ip_for_gateway() {
       struct iovec iovs[(send_info.headers ? std::min(seg_max, send_info.block_count) : 1) * max_iovs_per_msg];
       auto msg_size = send_info.header_size + send_info.payload_size;
       while (seg_index < send_info.block_count) {
+        if (send_info.cancelled()) return false;
         int iovlen = 0;
         auto segs_in_batch = std::min(send_info.block_count - seg_index, seg_max);
         if (send_info.headers) {
@@ -1084,18 +1091,12 @@ std::string get_local_ip_for_gateway() {
         // This will fail if GSO is not available, so we will fall back to non-GSO if
         // it's the first sendmsg() call. On subsequent calls, we will treat errors as
         // actual failures and return to the caller.
-        auto bytes_sent = sendmsg(sockfd, &msg, 0);
+        auto bytes_sent = sendmsg(sockfd, &msg, MSG_DONTWAIT);
         if (bytes_sent < 0) {
           // If there's no send buffer space, wait for some to be available
-          if (errno == EAGAIN) {
-            struct pollfd pfd;
-
-            pfd.fd = sockfd;
-            pfd.events = POLLOUT;
-
-            if (poll(&pfd, 1, -1) != 1) {
-              BOOST_LOG(warning) << "poll() failed: "sv << errno;
-              break;
+          if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            if (!send_wait::writable(sockfd, send_info.cancellation)) {
+              return false;
             }
 
             // Try to send again
@@ -1146,18 +1147,13 @@ std::string get_local_ip_for_gateway() {
       // Call sendmmsg() until all messages are sent
       size_t blocks_sent = 0;
       while (blocks_sent < send_info.block_count) {
-        int msgs_sent = sendmmsg(sockfd, &msgs[blocks_sent], send_info.block_count - blocks_sent, 0);
+        if (send_info.cancelled()) return false;
+        int msgs_sent = sendmmsg(sockfd, &msgs[blocks_sent], send_info.block_count - blocks_sent, MSG_DONTWAIT);
         if (msgs_sent < 0) {
           // If there's no send buffer space, wait for some to be available
-          if (errno == EAGAIN) {
-            struct pollfd pfd;
-
-            pfd.fd = sockfd;
-            pfd.events = POLLOUT;
-
-            if (poll(&pfd, 1, -1) != 1) {
-              BOOST_LOG(warning) << "poll() failed: "sv << errno;
-              break;
+          if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            if (!send_wait::writable(sockfd, send_info.cancellation)) {
+              return false;
             }
 
             // Try to send again
@@ -1168,6 +1164,7 @@ std::string get_local_ip_for_gateway() {
           return false;
         }
 
+        if (msgs_sent == 0) return false;
         blocks_sent += msgs_sent;
       }
 
@@ -1176,6 +1173,7 @@ std::string get_local_ip_for_gateway() {
   }
 
   bool send(send_info_t &send_info) {
+    if (send_info.cancelled()) return false;
     auto sockfd = (int) send_info.native_socket;
     struct msghdr msg = {};
 
@@ -1249,22 +1247,16 @@ std::string get_local_ip_for_gateway() {
 
     msg.msg_controllen = cmbuflen;
 
-    auto bytes_sent = sendmsg(sockfd, &msg, 0);
+    auto bytes_sent = sendmsg(sockfd, &msg, MSG_DONTWAIT);
 
     // If there's no send buffer space, wait for some to be available
-    while (bytes_sent < 0 && errno == EAGAIN) {
-      struct pollfd pfd;
-
-      pfd.fd = sockfd;
-      pfd.events = POLLOUT;
-
-      if (poll(&pfd, 1, -1) != 1) {
-        BOOST_LOG(warning) << "poll() failed: "sv << errno;
-        break;
+    while (bytes_sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+      if (!send_wait::writable(sockfd, send_info.cancellation)) {
+        return false;
       }
 
       // Try to send again
-      bytes_sent = sendmsg(sockfd, &msg, 0);
+      bytes_sent = sendmsg(sockfd, &msg, MSG_DONTWAIT);
     }
 
     if (bytes_sent < 0) {
@@ -1677,7 +1669,7 @@ std::string get_local_ip_for_gateway() {
     return true;
   }
 
-  std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+  static display_backend_e selected_display_backend(mem_type_e hwdevice_type, const video::config_t &config) {
     bool nvfbc_available = false;
     bool wayland_available = false;
     bool portal_available = false;
@@ -1701,7 +1693,7 @@ std::string get_local_ip_for_gateway() {
 
     const auto requested_backend = config.capture_generation.capture_backend;
     const bool exact_output_owned = !config.capture_generation.exact_display_name.empty();
-    const auto backend = choose_display_backend(
+    return choose_display_backend(
       requested_backend,
       exact_output_owned,
       nvfbc_available,
@@ -1711,6 +1703,21 @@ std::string get_local_ip_for_gateway() {
       x11_available,
       hwdevice_type == mem_type_e::cuda
     );
+  }
+
+  bool prepare_desktop_capture(mem_type_e hwdevice_type, const video::config_t &config,
+                               std::shared_ptr<void> &preparation) {
+#ifdef POLARIS_BUILD_PORTAL
+    if (selected_display_backend(hwdevice_type, config) == display_backend_e::portal) {
+      return portal::prepare_capture(hwdevice_type, config, preparation);
+    }
+#endif
+    return true;
+  }
+
+  std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    const auto requested_backend = config.capture_generation.capture_backend;
+    const auto backend = selected_display_backend(hwdevice_type, config);
     switch (backend) {
       case display_backend_e::nvfbc:
 #ifdef POLARIS_BUILD_CUDA
@@ -1794,14 +1801,48 @@ std::string get_local_ip_for_gateway() {
     );
   }
 
-  void reevaluate_capture_sources() {
+  /// Set while re-evaluating as if no backend were configured, so the auto-selection branches
+  /// below are reachable without mutating the user's saved configuration.
+  static std::optional<std::string> capture_backend_override;
+
+  /// Non-empty when the configured backend found nothing and auto-selection was used instead.
+  static std::string capture_backend_substitution;
+
+  /// False until an evaluation has actually run, so this can never report a problem it has not
+  /// looked for. Doctor asks this on every report, including before startup finishes.
+  static bool capture_sources_evaluated = false;
+
+  const std::string &requested_capture() {
+    return capture_backend_override ? *capture_backend_override : config::video.capture;
+  }
+
+  std::string describe_selected_sources() {
+#ifdef POLARIS_BUILD_CUDA
+    if (sources[source::NVFBC]) return "nvfbc";
+#endif
+#ifdef POLARIS_BUILD_WAYLAND
+    if (sources[source::WAYLAND]) return "wlr";
+#endif
+#ifdef POLARIS_BUILD_PORTAL
+    if (sources[source::PORTAL]) return "portal";
+#endif
+#ifdef POLARIS_BUILD_DRM
+    if (sources[source::KMS]) return "kms";
+#endif
+#ifdef POLARIS_BUILD_X11
+    if (sources[source::X11]) return "x11";
+#endif
+    return "none";
+  }
+
+  void evaluate_capture_sources() {
     sources.reset();
 
 #ifdef POLARIS_BUILD_CUDA
     const bool force_cage_wlr_capture = config::video.linux_display.use_cage_compositor
-                                     && (config::video.capture.empty() || config::video.capture == "wlr");
+                                     && (requested_capture().empty() || requested_capture() == "wlr");
 
-    if (!force_cage_wlr_capture && ((config::video.capture.empty() && sources.none()) || config::video.capture == "nvfbc")) {
+    if (!force_cage_wlr_capture && ((requested_capture().empty() && sources.none()) || requested_capture() == "nvfbc")) {
       if (verify_nvfbc()) {
         sources[source::NVFBC] = true;
       }
@@ -1809,8 +1850,8 @@ std::string get_local_ip_for_gateway() {
 #endif
 #ifdef POLARIS_BUILD_WAYLAND
     const bool virtual_output_needs_portal = host_virtual_display_needs_portal();
-    if (((config::video.capture.empty() && sources.none() && !virtual_output_needs_portal)
-         || config::video.capture == "wlr"
+    if (((requested_capture().empty() && sources.none() && !virtual_output_needs_portal)
+         || requested_capture() == "wlr"
          || config::video.linux_display.use_cage_compositor)) {
       // When cage/labwc is configured, prefer direct wlr capture over portal
       // and connect to labwc's socket instead of the desktop compositor.
@@ -1829,22 +1870,22 @@ std::string get_local_ip_for_gateway() {
     }
 #endif
 #ifdef POLARIS_BUILD_DRM
-    if ((config::video.capture.empty() && sources.none()) || config::video.capture == "kms") {
+    if ((requested_capture().empty() && sources.none()) || requested_capture() == "kms") {
       if (verify_kms()) {
         sources[source::KMS] = true;
       }
     }
 #endif
 #ifdef POLARIS_BUILD_PORTAL
-    if ((config::video.capture.empty() && sources.none()) || config::video.capture == "portal") {
+    if ((requested_capture().empty() && sources.none()) || requested_capture() == "portal") {
       if (verify_portal()) {
         sources[source::PORTAL] = true;
       }
-      else if (config::video.capture == "portal") {
+      else if (requested_capture() == "portal") {
         BOOST_LOG(warning) << "Portal capture requested but XDG Desktop Portal ScreenCast interface is not available"sv;
       }
     }
-    else if (config::video.capture.empty() && sources.any()) {
+    else if (requested_capture().empty() && sources.any()) {
       // Another source was already selected via auto-detection; log Portal as an alternative if available
       if (verify_portal()) {
         BOOST_LOG(info) << "XDG Desktop Portal ScreenCast is available. Set capture = portal to use it."sv;
@@ -1855,17 +1896,86 @@ std::string get_local_ip_for_gateway() {
 #ifdef POLARIS_BUILD_X11
     // We enumerate this capture backend regardless of other suitable sources,
     // since it may be needed as a NvFBC fallback for software encoding on X11.
-    if (config::video.capture.empty() || config::video.capture == "x11") {
+    if (requested_capture().empty() || requested_capture() == "x11") {
       if (verify_x11()) {
         sources[source::X11] = true;
       }
     }
 #endif
 
-    if (sources.none()) {
-      BOOST_LOG(warning) << "reevaluate_capture_sources: no capture method available for the current mode"sv;
-    }
   }
+
+  void reevaluate_capture_sources() {
+    capture_backend_override.reset();
+    capture_backend_substitution.clear();
+    capture_sources_evaluated = true;
+    evaluate_capture_sources();
+
+    if (!sources.none()) {
+      return;
+    }
+    if (config::video.capture.empty()) {
+      BOOST_LOG(warning) << "reevaluate_capture_sources: no capture method available for the current mode"sv;
+      return;
+    }
+
+    // A configured backend found nothing. That is usually not a broken host: several capture
+    // backends only exist on some compositors, and the stream mode decides which compositor gets
+    // enumerated at all. wlr capture, for instance, needs zwlr_export_dmabuf_manager_v1, which
+    // only wlroots compositors have; a cage mode enumerates Polaris' own labwc and works, while
+    // every non-cage mode has to enumerate the host desktop and finds nothing on KDE or GNOME.
+    //
+    // Leaving sources empty means no encoder can be probed, and Polaris goes on serving with no
+    // capture at all and H.264 as the only advertised codec. Auto-selection can usually still
+    // find a working backend, so take it and say loudly that the configured one was not used.
+    const auto requested = config::video.capture;
+    capture_backend_override = std::string {};
+    evaluate_capture_sources();
+    capture_backend_override.reset();
+
+    if (sources.none()) {
+      BOOST_LOG(error) << "capture = "sv << requested
+                       << " found no usable capture path, and neither did auto-selection. "sv
+                       << "No encoder can be probed in this state."sv;
+      return;
+    }
+
+    const auto selected = describe_selected_sources();
+    capture_backend_substitution = requested + " -> " + selected;
+    BOOST_LOG(warning) << "capture = "sv << requested
+                       << " cannot capture anything in the current stream mode, so Polaris is "sv
+                       << "using "sv << selected << " instead. On a compositor without the "sv
+                       << "wlroots capture protocols, only the private-compositor modes can use "sv
+                       << "wlr; every other mode has to capture the desktop. Set capture = "sv
+                       << selected << " to make this the configured choice."sv;
+    verified_action::confirm(
+      "video.configured_capture",
+      "Capture with the backend this host is configured to use",
+      requested,
+      selected
+    );
+  }
+
+  std::string capture_backend_substitution_note() {
+    return capture_backend_substitution;
+  }
+
+  bool capture_sources_missing() {
+    return capture_sources_evaluated && sources.none();
+  }
+
+#ifdef POLARIS_TESTS
+  void set_capture_sources_missing_for_tests(bool missing) {
+    capture_sources_evaluated = missing;
+    sources.reset();
+  }
+#endif
+
+#ifdef POLARIS_TESTS
+  void set_capture_backend_substitution_for_tests(const std::string &note) {
+    capture_backend_substitution = note;
+  }
+#endif
 
   std::unique_ptr<deinit_t> init() {
     // enable low latency mode for AMD

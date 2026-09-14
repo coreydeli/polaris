@@ -240,7 +240,7 @@ events), and extras (an input-only app entry for TV workflows, rumble forwarding
 | **Randomize DualSense MAC Address** (`ds5_inputtino_randomize_mac`) | Randomize the emulated DualSense MAC address to improve compatibility with some games and clients. |
 | **Isolate Host Gamepads in Private Stream** (`headless_gamepad_isolation`) | Prevents controllers physically connected to the host from appearing inside Private Stream sessions. Disable only when you intentionally use a host-wired controller, such as a DualSense for haptics or adaptive triggers. |
 | **Isolate Client Gamepads from Other Linux Users** (`client_gamepad_seat_isolation`) | Disabled by default to preserve controller identity and local access. When enabled, uses Polaris-specific device names and a dedicated Linux seat so logind does not grant the active local desktop user automatic access. This does not isolate applications running under the same Unix account or users in the input group. Re-run Polaris host setup after upgrading, then stop active streams and restart Polaris so existing controller nodes are recreated. |
-| **Experimental Moonlight Multiseat Input** (`multiseat_moonlight_input`) | Linux-only, file-configured preview gate for the container multiseat input owner. It is disabled by default and does not select a seat by itself; only a separately authenticated, already-admitted seat selection can use it. Leave disabled outside bounded development testing. |
+| **Experimental Moonlight Multiseat Input** (`multiseat_moonlight_input`) | Linux-only, file-configured preview gate for the host side of multiseat input. It is disabled by default and does not select a seat by itself; only a separately authenticated, already-admitted seat selection can use it. Leave disabled outside bounded development testing. |
 | **Home/Guide Button Emulation Timeout** (`back_button_timeout`) | If the Back/Select button is held down for the specified number of milliseconds, a Home/Guide button press is emulated. If set to a value < 0 (default), holding the Back/Select button will not emulate the Home/Guide button. |
 | **Enable Keyboard Input** (`keyboard`) | Allows guests to control the host system with the keyboard |
 | **Key Repeat Delay** (`key_repeat_delay`) | Control how fast keys will repeat themselves. The initial delay in milliseconds before repeating keys. |
@@ -389,48 +389,16 @@ Recommended values:
 
 ## VA-API Encoder
 
-VA-API is the default hardware-encode path for AMD and Intel Mesa hosts (`encoder = vaapi`). The options
-below apply to every codec Polaris probes over VA-API (H.264, HEVC, and AV1) and are exposed on the
-VA-API encoder tab in the web UI.
+VA-API is the default hardware-encode path for AMD and Intel Mesa hosts (`encoder = vaapi`). The session
+controls apply to every codec Polaris probes over VA-API (H.264, HEVC, and AV1) and are exposed on the
+VA-API encoder tab in the web UI; see [VA-API session controls](#va-api-session-controls) for the full
+key reference.
 
 The read-only **Hardware codec support** panel at the top of the tab shows what this GPU actually passed
 validation for: the active encoder plus H.264/HEVC/AV1 rows with HDR markers where the probe accepted a
 Main10/P010 configuration. Polaris advertises AV1 to clients whenever this hardware passes AV1 validation
 and falls back to HEVC when it does not, so leave `av1_mode` on its default and let the panel show which
 codecs will actually be used.
-
-### vaapi_rc_mode
-
-Selects FFmpeg's VA-API rate-control mode for all three codecs. `0` (auto) is the default and preserves
-Polaris's historical selection: CBR when a strict RC buffer or an Intel/AV1 path applies, otherwise VBR.
-An explicit value passes through to FFmpeg untouched; if this driver does not support it, every VA-API
-codec probe fails with `Driver does not support <mode> RC mode (supported modes: ...)` and Polaris falls
-back to software encoding rather than silently substituting a different mode.
-
-| Value | Mode | Notes |
-| ---: | --- | --- |
-| `0` | Auto (default) | Historical behavior; picks CBR or VBR from your stream settings. |
-| `1` | CQP | Constant quantisation parameter; ignores the bitrate target. |
-| `2` | CBR | Constant bitrate with VBV compliance where supported. |
-| `3` | VBR | Variable bitrate within the adaptive range. |
-| `4` | ICQ | Intel constant-quality (AVBR); unsupported on current AMD/Mesa drivers. |
-| `5` | QVBR | Quality-based VBR; requires VA-API 1.3 and driver support. |
-| `6` | AVBR | Average-bitrate mode without a hard ceiling; rarely exposed by drivers. |
-
-On an RX 7900 XTX (RADV, navi31) the supported set is CQP, CBR, VBR, and QVBR; modes outside it fail
-the probe as described above.
-
-### vaapi_low_power
-
-Restricts Polaris to the driver's low-power VA-API entrypoint where available. Useful for battery or
-thermal headroom on laptops. When the profile exposes no low-power entrypoint (typical on desktop AMD),
-Polaris logs a warning and continues with the normal entrypoint instead of failing the codec.
-
-### vaapi_blbrc
-
-Enables driver-side block-level bitrate control (`VA_RC_MB`) where the driver exposes it, typical of
-Intel GPUs. Current AMD/Mesa drivers do not report `VA_RC_MB`, so this is a no-op there: FFmpeg logs
-`Driver does not support BLBRC.` and encoding continues normally.
 
 ## Vulkan Encoder
 
@@ -492,7 +460,38 @@ ai_enabled = enabled
 ai_provider = anthropic
 ai_model = claude-haiku-4-5-20251001
 ai_auth_mode = subscription
+ai_timeout_ms = 30000
 ```
+
+For Claude subscription explanations, install a current [Claude Code CLI](https://code.claude.com/docs/en/cli-reference)
+with `--safe-mode` support on the Polaris host. Sign in as the same OS user running Polaris:
+
+```bash
+claude auth login
+claude auth status
+```
+
+Polaris reuses that CLI subscription login. There is no separate Claude login in the web UI,
+and a login on another computer or under `root` does not authorize the Polaris service account.
+Choose **Claude → Claude CLI**, run **Test provider**, then save and enable explanations.
+The saved-runtime status distinguishes CLI discovery from verified subscription authentication.
+
+Doctor sends redacted evidence through a private, temporary request directory, with CLI tools,
+MCP servers, ordinary discovered customizations, and session persistence disabled. The installed,
+unmodified Claude Code and its administrator configuration are trusted host software: managed
+hooks and policy can still run with the service user's permissions. This is not an OS sandbox.
+Polaris does not collect, copy, or intermediate subscription tokens; sign-in stays with Claude Code.
+Polaris validates the returned explanation and does not apply settings or run recovery actions
+from AI responses. This response boundary also applies to the other Doctor providers.
+Requests use the configured timeout, bounded to 1–120 seconds, and a 64 KiB output limit.
+Older CLIs that do not support the required restriction flags fail rather than retrying without them.
+This Doctor transport uses Claude subscriptions; Anthropic API-key Doctor explanations remain unsupported.
+
+Subscription availability is provider-specific. OpenAI uses the signed-in Codex CLI below.
+DeepSeek's documented integration uses an API key; signing into its chat website does not establish
+a supported Polaris subscription transport. Local endpoints can run without a provider account.
+See [Claude Code authentication and credential use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
+and [DeepSeek's API setup](https://api-docs.deepseek.com/).
 
 ### OpenAI
 
@@ -513,6 +512,33 @@ ai_model = gemini-2.5-flash
 ai_auth_mode = api_key
 ai_api_key = YOUR_GEMINI_KEY
 ```
+
+### DeepSeek
+
+Select the **DeepSeek** provider and **DeepSeek API** profile in the web UI, enter a DeepSeek
+API key, refresh the model list, and run **Test Explanation** before saving. To configure it
+directly:
+
+```ini
+ai_enabled = enabled
+ai_provider = deepseek
+ai_model = deepseek-v4-flash
+ai_auth_mode = api_key
+ai_api_key = YOUR_DEEPSEEK_KEY
+ai_base_url = https://api.deepseek.com
+ai_timeout_ms = 30000
+```
+
+The profile uses DeepSeek's [OpenAI-compatible endpoint](https://api-docs.deepseek.com/) for
+model discovery and chat completions, with [JSON-object output](https://api-docs.deepseek.com/guides/json_mode/)
+and thinking disabled for bounded explanations. Polaris validates the returned explanation against
+the same six-field contract and keeps deterministic Doctor results as the source of truth.
+
+If you previously entered a DeepSeek URL under OpenAI or Anthropic, select the DeepSeek API profile
+and enter its key again. This sets the compatible output format and base URL; the Anthropic
+`/anthropic` endpoint is not used by Polaris's Doctor explanation path. Subscription login is not
+supported for DeepSeek. Model discovery reflects the API's current list; the configured default is
+only a fallback when discovery is unavailable.
 
 ### Local OpenAI-compatible server
 
@@ -575,3 +601,81 @@ Optional DRM/KMS setup:
 ```bash
 sudo -H polaris --setup-host --enable-kms
 ```
+
+
+### VA-API session controls
+
+These settings apply to VA-API on Linux. A successful web configuration save
+publishes the settings for the next encoder session; an active codec keeps its
+current settings. Hand-edited configuration is loaded when Polaris starts.
+
+| Setting | Default | Choices |
+| --- | --- | --- |
+| `vaapi_quality` | `auto` | `auto`, `speed`, `balanced`, `quality` |
+| `vaapi_rc` | `auto` | `auto`, `cbr`, `vbr`, `avbr`, `cqp`, `icq`, `qvbr` |
+| `vaapi_blbrc` | `auto` | `auto`, `enabled`, `disabled` |
+| `vaapi_strict_rc_buffer` | `disabled` | `enabled`, `disabled` |
+
+Automatic quality and block bitrate control leave the codec's existing defaults
+untouched. Automatic rate control preserves Polaris's current policy: Intel,
+AV1, and explicit strict-buffer requests prefer VBR with a single-frame buffer,
+then CBR, then CQP. Other paths prefer CBR, then VBR, then CQP with the existing
+buffer size. No new AMD or Intel default is promoted by these controls.
+
+Quality presets use the selected driver profile and encoding entrypoint's
+reported range: quality selects level 1, speed selects the highest level, and
+balanced selects half the range, rounded down with a minimum of 1. Unknown or
+unsupported ranges retain the driver default. This adjusts encoding effort;
+it is separate from the `qp` setting.
+
+A manual rate-control choice must be supported by both the driver and codec.
+Unsupported choices use automatic policy and produce a warning. A supported
+manual mode overrides the Intel/AV1 buffer preference; `vaapi_strict_rc_buffer`
+still requests a single-frame buffer. CQP, ICQ, and QVBR use `qp` for their
+quality value. CQP and ICQ do not enforce a bitrate target; FFmpeg may ignore
+buffer settings in modes that do not use a hypothetical reference decoder.
+
+Block bitrate control requires the driver's `VA_RC_MB` capability and a mode
+other than CQP. An unsupported enable request is reported and disabled when
+the codec exposes the option. Startup logs report the selected rate control,
+selection policy, buffer choice, compression level, quality range, and block
+bitrate control. Controls are queried for every encoder initialization, using
+the selected profile and entrypoint. Existing DMA-BUF containment is preserved.
+
+Example of an opt-in configuration:
+
+```ini
+vaapi_quality = balanced
+vaapi_rc = vbr
+vaapi_blbrc = enabled
+vaapi_strict_rc_buffer = enabled
+```
+
+These settings follow the [libva quality and rate-control API](https://github.com/intel/libva/blob/master/va/va.h)
+and [FFmpeg VA-API mode handling](https://github.com/FFmpeg/FFmpeg/blob/n8.0/libavcodec/vaapi_encode.c).
+Hardware acceptance on AMD and Intel is required before changing automatic
+encoder defaults.
+
+### Stable KMS connector selection
+
+With KMS capture, `output_name` accepts the connector's kernel name (for example
+`DP-1` or `HDMI-A-1`) when that name identifies one available output. The log
+also lists a qualified form such as `kms:pci-0000:01:00.0/DP-1`. Qualification
+uses the GPU's PCI address, not its changing `/dev/dri/cardN` number. The
+`pci-0000:01:00.0/DP-1` shorthand is accepted too.
+
+Use the qualified form when different GPUs expose the same connector name.
+An ambiguous or missing request fails; Polaris does not select another output.
+Named capture rechecks the opened GPU, connector, and CRTC during initialization
+and rechecks the connector binding while capturing. A disconnect or reassignment
+requires capture reinitialization. Replugging the same physical port can resolve
+its qualified name even when card or display enumeration order changes.
+
+Existing numeric configurations retain the original enumeration positions. The
+list is not sorted or renumbered by the new names. A GPU without a reliable PCI
+identity, or a connector with multiple active capture planes, retains numeric
+selection. When unnamed entries remain, use qualified names for named requests;
+a plain connector alias cannot rule out ambiguity with those entries.
+
+These identifiers select KMS capture outputs. They do not change the X11,
+Wayland private-runtime, Windows, or macOS display-selection contracts.

@@ -22,6 +22,7 @@
 
 // local includes
 #include "config.h"
+#include "configuration_store.h"
 #include "confighttp_validation.h"
 #include "entry_handler.h"
 #include "file_handler.h"
@@ -566,9 +567,6 @@ namespace config {
 
     {
       false,  // strict_rc_buffer
-      0,     // rc_mode (auto)
-      false, // low_power
-      false, // blbrc
     },  // vaapi
 
     {
@@ -1255,6 +1253,41 @@ namespace config {
     return opts;
   }
 
+  int write_config_with_vaapi_settings(const std::string &path, const std::string &contents,
+                                     const std::optional<std::string> &expected) {
+    if (configuration_store::replace(path, contents, expected) != configuration_store::result::committed) return -1;
+    vaapi::publish(parse_vaapi_settings(parse_config(contents)));
+    return 0;
+  }
+
+  vaapi::settings_t parse_vaapi_settings(const std::unordered_map<std::string, std::string> &vars,
+                                       vaapi::settings_t initial) {
+    const auto text = [&](const char *key) -> std::string_view {
+      const auto found = vars.find(key);
+      return found == vars.end() ? std::string_view {} : found->second;
+    };
+    const auto option = [&](const char *key, auto &setting, const auto &names) {
+      const auto value = text(key);
+      if (value.empty()) return;
+      if (const auto parsed = vaapi::parse(value, names)) setting = *parsed;
+      else BOOST_LOG(warning) << "Ignoring invalid " << key << ": " << value;
+    };
+    option("vaapi_quality", initial.quality, vaapi::quality_names);
+    option("vaapi_rc", initial.rc, vaapi::rc_names);
+    const auto block = text("vaapi_blbrc");
+    if (block == "auto") initial.blbrc.reset();
+    else if (!block.empty()) {
+      if (const auto parsed = parse_bool(block)) initial.blbrc = *parsed;
+      else BOOST_LOG(warning) << "Ignoring invalid vaapi_blbrc: " << block;
+    }
+    const auto strict = text("vaapi_strict_rc_buffer");
+    if (!strict.empty()) {
+      if (const auto parsed = parse_bool(strict)) initial.strict_rc_buffer = *parsed;
+      else BOOST_LOG(warning) << "Ignoring invalid vaapi_strict_rc_buffer: " << strict;
+    }
+    return initial;
+  }
+
   void apply_config(std::unordered_map<std::string, std::string> &&vars) {
 #ifndef __ANDROID__
     // TODO: Android can possibly support this
@@ -1354,10 +1387,9 @@ namespace config {
     int_f(vars, "vt_software", video.vt.vt_require_sw, vt::force_software_from_view);
     int_f(vars, "vt_realtime", video.vt.vt_realtime, vt::rt_from_view);
 
-    bool_f(vars, "vaapi_strict_rc_buffer", video.vaapi.strict_rc_buffer);
-    int_between_f(vars, "vaapi_rc_mode", video.vaapi.rc_mode, {0, 6});
-    bool_f(vars, "vaapi_low_power", video.vaapi.low_power);
-    bool_f(vars, "vaapi_blbrc", video.vaapi.blbrc);
+    video.vaapi = parse_vaapi_settings(vars, video.vaapi);
+    vaapi::publish(video.vaapi);
+    for (const auto key : {"vaapi_quality", "vaapi_rc", "vaapi_blbrc", "vaapi_strict_rc_buffer"}) vars.erase(key);
 
     int_f(vars, "vk_tune", video.vk.tune);
     int_f(vars, "vk_rc_mode", video.vk.rc_mode);
@@ -1725,9 +1757,30 @@ namespace config {
 
     bool config_loaded = false;
     try {
-      // Create appdata folder if it does not exist
+      // Create appdata folder if it does not exist.
+      //
+      // It holds credentials, tokens and session state, and the private-state
+      // guard refuses any directory that is group or other writable. Directory
+      // creation honours the umask, so on a host with umask 002 Polaris would
+      // create this at 0775 and then refuse to write into it, with a failed
+      // credential save as the only symptom. Narrow it on the way in rather
+      // than depending on the umask the user happens to have.
       const auto appdata_dir = platf::appdata();
       file_handler::make_directory(appdata_dir.string());
+      if (std::error_code permissions_error; true) {
+        fs::permissions(
+          appdata_dir,
+          fs::perms::owner_all,
+          fs::perm_options::replace,
+          permissions_error
+        );
+        if (permissions_error) {
+          BOOST_LOG(warning)
+            << "Could not restrict ["sv << appdata_dir.string()
+            << "] to this account: "sv << permissions_error.message()
+            << ". Saving credentials will fail if it is group or other writable."sv;
+        }
+      }
 
       // Migration: if an older Polaris build left a Sunshine-named config in
       // Polaris's own config directory, copy it to polaris.conf once. Keep the

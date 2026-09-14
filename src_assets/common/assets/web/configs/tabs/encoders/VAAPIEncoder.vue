@@ -17,10 +17,45 @@ const config = ref(props.config)
       <div class="settings-section-header">
         <div class="section-kicker">Linux GPU Encoding</div>
         <h3 class="settings-section-title">VA-API behavior</h3>
-        <p class="settings-section-copy">Tune Polaris's VA-API path for AMD and Intel GPUs: rate-control mode, driver features, and strict bitrate compliance.</p>
+        <p class="settings-section-copy">{{ $t('config.vaapi_session_settings_desc') }}</p>
       </div>
 
       <CodecSupportPanel :config="config" />
+
+      <div class="mb-3">
+        <label for="vaapi_quality" class="block text-sm font-medium text-storm mb-1">{{ $t('config.vaapi_quality') }}</label>
+        <select id="vaapi_quality" class="settings-input" v-model="config.vaapi_quality">
+          <option value="auto">{{ $t('auto') }}</option>
+          <option value="speed">{{ $t('config.vaapi_quality_speed') }}</option>
+          <option value="balanced">{{ $t('config.vaapi_quality_balanced') }}</option>
+          <option value="quality">{{ $t('config.vaapi_quality_quality') }}</option>
+        </select>
+        <div class="text-sm text-storm mt-1">{{ $t('config.vaapi_quality_desc') }}</div>
+      </div>
+
+      <div class="mb-3">
+        <label for="vaapi_rc" class="block text-sm font-medium text-storm mb-1">{{ $t('config.vaapi_rc') }}</label>
+        <select id="vaapi_rc" class="settings-input" v-model="config.vaapi_rc">
+          <option value="auto">{{ $t('auto') }}</option>
+          <option value="cbr">CBR</option>
+          <option value="vbr">VBR</option>
+          <option value="avbr">AVBR</option>
+          <option value="cqp">CQP</option>
+          <option value="icq">ICQ</option>
+          <option value="qvbr">QVBR</option>
+        </select>
+        <div class="text-sm text-storm mt-1">{{ $t('config.vaapi_rc_desc') }}</div>
+      </div>
+
+      <div class="mb-3">
+        <label for="vaapi_blbrc" class="block text-sm font-medium text-storm mb-1">{{ $t('config.vaapi_blbrc') }}</label>
+        <select id="vaapi_blbrc" class="settings-input" v-model="config.vaapi_blbrc">
+          <option value="auto">{{ $t('auto') }}</option>
+          <option value="enabled">{{ $t('config.vaapi_option_enabled') }}</option>
+          <option value="disabled">{{ $t('config.vaapi_option_disabled') }}</option>
+        </select>
+        <div class="text-sm text-storm mt-1">{{ $t('config.vaapi_blbrc_desc') }}</div>
+      </div>
 
       <Checkbox class="mb-3"
                 id="vaapi_strict_rc_buffer"
@@ -28,40 +63,6 @@ const config = ref(props.config)
                 v-model="config.vaapi_strict_rc_buffer"
                 default="false"
       ></Checkbox>
-
-      <div class="settings-subtle-surface mb-3">
-        <div class="eyebrow-label mb-2">{{ $t('config.vaapi_rc_group') }}</div>
-        <div class="mb-0">
-          <label for="vaapi_rc_mode" class="block text-sm font-medium text-storm mb-1">{{ $t('config.vaapi_rc_mode') }}</label>
-          <select id="vaapi_rc_mode" class="settings-input" v-model="config.vaapi_rc_mode">
-            <option value="0">{{ $t('config.vaapi_rc_auto') }}</option>
-            <option value="1">{{ $t('config.vaapi_rc_cqp') }}</option>
-            <option value="2">{{ $t('config.vaapi_rc_cbr') }}</option>
-            <option value="3">{{ $t('config.vaapi_rc_vbr') }}</option>
-            <option value="4">{{ $t('config.vaapi_rc_icq') }}</option>
-            <option value="5">{{ $t('config.vaapi_rc_qvbr') }}</option>
-            <option value="6">{{ $t('config.vaapi_rc_avbr') }}</option>
-          </select>
-          <div class="text-sm text-storm mt-1">{{ $t('config.vaapi_rc_mode_desc') }}</div>
-        </div>
-      </div>
-
-      <div class="settings-subtle-surface">
-        <div class="eyebrow-label mb-2">{{ $t('config.vaapi_driver_features_group') }}</div>
-        <Checkbox class="mb-3"
-                  id="vaapi_low_power"
-                  locale-prefix="config"
-                  v-model="config.vaapi_low_power"
-                  default="false"
-        ></Checkbox>
-
-        <Checkbox class="mb-0"
-                  id="vaapi_blbrc"
-                  locale-prefix="config"
-                  v-model="config.vaapi_blbrc"
-                  default="false"
-        ></Checkbox>
-      </div>
     </section>
   </div>
 </template>

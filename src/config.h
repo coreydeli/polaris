@@ -3,6 +3,7 @@
  * @brief Declarations for the configuration of Sunshine.
  */
 #pragma once
+#include "vaapi_config.h"
 
 // standard includes
 #include <bitset>
@@ -83,12 +84,7 @@ namespace config {
       int vt_coder;
     } vt;
 
-    struct {
-      bool strict_rc_buffer;
-      int rc_mode;  ///< FFmpeg VA-API rate control mode: 0=auto, 1=CQP, 2=CBR, 3=VBR, 4=ICQ, 5=QVBR, 6=AVBR
-      bool low_power;
-      bool blbrc;
-    } vaapi;
+    vaapi::settings_t vaapi;
 
     struct {
       int tune;
@@ -430,6 +426,12 @@ namespace config {
    * @return The parsed value, or nullopt when the text is not a boolean.
    */
   std::optional<bool> parse_bool(std::string_view value);
+
+  int write_config_with_vaapi_settings(const std::string &path, const std::string &contents,
+                                     const std::optional<std::string> &expected = std::nullopt);
+
+  vaapi::settings_t parse_vaapi_settings(const std::unordered_map<std::string, std::string> &vars,
+                                       vaapi::settings_t initial = {});
 
   int parse(int argc, char *argv[]);
   bool is_valid_command_prefix(std::string_view argument);

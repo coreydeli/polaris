@@ -3,30 +3,31 @@
 This directory defines an offline-reviewable image recipe. It does not enable
 multiseat or make the current Polaris process a container controller.
 
-`images.lock.json` contains the only accepted build and runtime inputs. Every
-reference names an immutable OCI index digest; moving tags are intentionally
-absent. The plain Gamescope-capable base and the Steam, Heroic, and Lutris
-variants all receive the same static `polaris-seat-worker`,
+`images.lock.json` distinguishes immutable source roots, dependency locks, and
+produced worker artifacts. The Gamescope, Steam, Heroic, and Lutris source roots
+each receive an offline runtime dependency stage, a Wayland GStreamer plugin
+compiled against that root's ABI, pinned Gamescope 3.16.19, and the same static `polaris-seat-worker`,
 `polaris-seat-runtime` dispatcher, and private session-bus, audio,
 display/capture, and nested Gamescope provider binaries. Keeping the launchers
 separate avoids multiplying package and credential state inside one large
 image.
 
-The build stage has no module or package download step. The worker, dispatcher,
-and four providers use only the Go standard library, disable CGO and
+Final build stages have no module or package download step. The worker, dispatcher,
+and six providers use only the Go standard library, disable CGO and
 module-network access, run their tests, then emit static Linux/amd64 binaries.
 The final stage fails its build unless the locked root supplies the fixed D-Bus,
-PipeWire, `pw-cli`, `pactl`, GStreamer, Gamescope, and Xwayland executables; the
+PipeWire, `pw-cli`, `pw-dump`, WirePlumber, `pactl`, GStreamer, Gamescope, and Xwayland executables; the
 `waylanddisplaysrc`, `unixfdsink`, `unixfdsrc`, and `fakesink` elements; and both
-trusted PipeWire configuration files. A future image job must select a
-runtime reference from the lock, build at an exact Polaris revision, record
-the resulting image digest, and hand only that final digest to the Podman
-backend. The existing locked application roots have not yet passed that new
-GStreamer dependency gate; no compatible image is claimed by this checkpoint.
+trusted PipeWire configuration files. The image job builds all four Linux/amd64
+profiles at an exact Polaris revision and exports downloadable OCI archives,
+verified manifest and configuration digests, package manifests, CycloneDX SBOMs,
+dependency lock hashes, and isolated real-provider receipts. See
+[RUNTIME-IMAGES.md](RUNTIME-IMAGES.md) for the fetch/build split, NVIDIA physical
+lane, acceptance scope, and lock refresh procedure.
 
 These locks establish immutable byte identity, not publisher trust. No
-signature, attestation, SBOM, vulnerability policy, or license bundle is
-claimed by this spike. A publishable image must add those gates and retain the
+signature, attestation, vulnerability policy, or complete license bundle is
+claimed by this milestone. A publishable image must add those gates and retain the
 resolved upstream manifests as provenance evidence before any lock refresh.
 
 The current entrypoint is intentionally a supervisor and IPC proof. It owns
@@ -41,16 +42,39 @@ publish the exact `POLARIS-RUNTIME-READY/1` record on an inherited descriptor
 before the stage is ready. Shutdown targets the owned process group with TERM
 and escalates to KILL at the component deadline.
 
-That adapter set is a concrete supervision boundary, not the missing media
-implementation. The image now carries `polaris-seat-runtime` plus real private
-session-bus, audio, outer display/capture, and nested Gamescope providers, but
-the production `run` command still injects no adapters. The other three
-provider locations remain absent, so this image does not start Steam, Heroic,
-Lutris, encoding, or virtual input. Treating its healthy supervisor as a
-streaming-capable worker would still be a false gate. Tests exercise catalog
-creation, the synthetic process boundary, the real dispatcher, and isolated
-host D-Bus, PipeWire, Wayland, and raw-frame transports; they never invoke a
-launcher or physical device.
+The image carries the dispatcher and private session-bus, audio, outer capture,
+nested Gamescope, verified input-reader, and experimental launcher providers.
+The launcher currently accepts only the image-owned `input-pong-v1` workload
+with the Gamescope profile. This small offline X11 game exercises keyboard,
+pointer, optional gamepad, and private Pulse audio without launcher accounts.
+Its executable is compiled against each profile's locked X11/GStreamer ABI;
+image checks resolve its ELF dependencies and the SBOM records its source hash.
+The launcher validates the allocated display protocols, retained compositor process lifetime, and input identities,
+retains the private profile, and owns its entire descendant process tree,
+including helpers that detach into another session.
+
+The isolated physical game harness can also run bounded codec observations.
+`POLARIS_PHYSICAL_ENCODED_GAME=1` checks captured game motion through OpenH264;
+`POLARIS_PHYSICAL_ENCODED_AUDIO=1` checks the allocated sink monitor through
+Opus at 48 kHz stereo with 5 ms packets capped at 1400 bytes. Both require
+`POLARIS_PHYSICAL_GAME=1`. The audio check pins the private Pulse socket, checks
+the selected monitor, and measures the fixed game's quiet 440 Hz tone after
+decoding. Each enabled observation runs for both seats and again for the
+surviving seat after its peer's container is removed. These observations prove
+worker-local codec roundtrips; continuous media transport and client playback
+remain separate acceptance gates.
+
+The production `run` command still injects no adapters, so no worker announces
+a media contract yet. Worker-local encoding is still missing, and the Steam,
+Heroic, and Lutris launcher implementations remain outstanding. The controller
+side of the media path is now complete: a worker that announces a contract on
+its media channel has it held against what the client negotiated, acknowledged,
+and its frames carried to that client's own packet destination, with keyframe
+requests and reference invalidations travelling back on control. What is left
+between here and a streaming worker is the producer. Provider readiness proves a resource or
+supervised process is available; it does not prove game frames reached a client.
+Unit tests and isolated physical input receipts likewise do not establish
+compositor input delivery or successful game streaming.
 
 The controller now also has an injected host-brokered input authority and a
 Linux inputtino lifecycle backend, but neither is wired to this image or the
@@ -150,10 +174,10 @@ real stream session, constructs the hub as the inputtino sink, or supplies the
 mailbox endpoint which reaches a client's control thread. The singleton runtime
 constructs none of these classes. The worker's older opaque input/feedback test adapter is
 deliberately not treated as injection authority. Mediated Steam Input also
-remains missing. Rootless supplementary-group and SELinux access require an
-explicit deployment decision and physical validation; this source checkpoint
-does not add `keep-groups`, change host policy, or claim that an image can use
-the mapped nodes.
+remains missing. Rootless launches now require trusted crun, the actual launching UID and
+`keep-groups`. The optional policy under `selinux/` labels only reserved
+multiseat event nodes. Policy installation remains explicit; the isolated
+harness must establish device access for each selected final image.
 
 The dispatcher and worker share one canonical stage parser and environment
 builder. Before it can touch a provider, the dispatcher rejects reordered or
@@ -225,7 +249,7 @@ but Gamescope 3.16 has no exact render-node-path selector. Exact GPU authority
 therefore remains the container backend's explicit device allowlist and outer
 Wayland binding, not an environment-variable claim.
 
-Gamescope 3.16.25's `--ready-fd` option is a FIFO path despite its name. It
+Gamescope 3.16.19's `--ready-fd` option is a FIFO path despite its name. It
 writes exactly one `DISPLAY WAYLAND_DISPLAY` line only after its Xwayland
 server and compositor context initialize. Polaris creates that FIFO and the
 limiter file under the private runtime, rejects any pre-existing Gamescope
@@ -339,3 +363,117 @@ it audits at most 256 root entries through no-follow descriptors and recovers
 only valid signed records absent from that authoritative inventory. Active,
 ambiguous, malformed, replaced, unexpected, or live-socket state is retained
 and blocks admission rather than being deleted by name or recursively.
+
+## Isolated input acceptance with crun
+
+The experimental input provider verifies every fixed alias using read-only
+evdev descriptors, generation-specific kernel names and physical identities.
+It rejects unexpected aliases, duplicate devices, missing core devices and
+noncontiguous gamepad slots. Descriptors remain owned until shutdown; periodic
+checks fail on namespace replacement or source-device removal. The display
+request can explicitly select an input seat. That path supplies only verified
+keyboard/pointer aliases to the pinned compositor plugin and requires that the
+actual producer retain them before reporting ready. Requests without an input
+seat preserve the existing capture-only behavior. The production entrypoint
+still supplies no runtime adapters.
+
+The opt-in SELinux policies permit only the three evdev identity queries
+(`EVIOCGVERSION`, `EVIOCGNAME`, `EVIOCGPHYS`) in addition to event reads. Broader
+compositor capability queries and real game input delivery need separate
+physical verification; the new provider does not yet establish that acceptance.
+
+The Linux worker backend explicitly selects `/usr/bin/crun` and combines
+`--group-add=keep-groups` with `--userns=keep-id`. The runtime must be a
+root-owned regular executable below root-owned directories that are not
+writable by other users. Launch reads the calling process's supplementary
+groups with `getgroups()` and rechecks that snapshot and device access at
+invocation. Account membership alone is insufficient: a user service must
+actually inherit the needed groups. Runtime and group failures reject new
+launches; stopping an existing worker remains available.
+
+Authoritative inventory requires the selected crun path and the OCI
+`run.oci.keep_original_groups=1` annotation. Podman consumes `keep-groups`
+while creating the OCI specification, so its inspected `HostConfig.GroupAdd`
+is empty. OCI `additionalGids` describe namespace IDs and are not evidence
+that host supplementary groups were retained. The existing exact device and
+mount classifier still applies. SELinux stays enforcing.
+
+`MultiseatPhysical.TwoWorkersReadOnlyTheirAllocatedInputAndStopIndependently`
+is an opt-in acceptance test. Set `POLARIS_MULTISEAT_PHYSICAL=1`, an exact
+`POLARIS_PHYSICAL_IMAGE`, a private `POLARIS_PHYSICAL_IPC_ROOT` parent, and
+two distinct pre-created profile volumes through `POLARIS_PHYSICAL_VOLUME`
+and `POLARIS_PHYSICAL_VOLUME_B`. `POLARIS_PHYSICAL_IMAGE` must be a manifest
+digest reference, `name@sha256:<64 hex>`; a tag is refused before launch.
+
+Each profile volume must be private before a worker can use it. Podman creates
+a volume's data directory mode 0755, the image carries no `/var/lib/polaris-seat`
+for Podman to copy up from, and the worker requires its own profile directory to
+be exactly mode 0700 owned by its effective uid, so a correctly created volume
+otherwise fails with `private directory ownership or mode is unsafe` before any
+provider starts:
+
+```sh
+podman volume create pv-seat-a
+chmod 0700 "$(podman volume inspect pv-seat-a --format '{{.Mountpoint}}')"
+```
+
+Admission should check this before launch rather than leaving it to the worker;
+until it does, it is an operator step. `POLARIS_PHYSICAL_PROFILE` selects gamescope,
+steam, heroic, or lutris. The image must contain the separately packaged
+`polaris-seat-input-probe` acceptance helper. GPU device paths must belong to
+the explicit catalog supplied through the physical harness environment.
+
+That catalog must include the GPU's DRM primary node, not only its render node.
+Gamescope's Vulkan backend checks `VkPhysicalDeviceDrmPropertiesEXT::hasPrimary`
+whenever the backend does not present through a Vulkan swapchain, which is the
+case for the Wayland backend this provider uses, and exits with `physical device
+has no primary node` when the node is absent from the container. The harness
+derives the default from the render node's sysfs sibling and refuses a catalog
+without one, because the symptom otherwise arrives as a nested compositor whose
+runtime helper never became ready.
+
+The harness creates a unique deployment and authority root, opens every
+allocated event alias inside both workers, checks major/minor identity and
+absence of other input nodes, and sends bounded synthetic input through the
+host authority. It checks the second worker again after stopping the first.
+Any forced container cleanup fails acceptance; cleanup only targets captured
+container IDs and never recursively removes caller-provided authority roots.
+Passing this test establishes isolated input and worker lifecycle. Production
+provider selection and multiseat activation remain off; it does not establish
+successful game streaming.
+
+The worker UID is passed explicitly, because an image `USER` can override
+Podman's implicit `keep-id` choice. Live inventory requires matching Config.User
+and OCI process.user.uid evidence. Use a short private IPC parent for the
+physical harness so both generated Unix socket paths fit Linux's 108-byte limit.
+
+Experimental compositor input uses the fixed native `capture-input` producer.
+The Go provider verifies and passes already-open, read-only keyboard and mouse
+descriptors in a fixed order. A bounded native decoder sends the pinned plugin's
+existing input events. It performs no device discovery, device writes, or input
+ioctls and needs no host udev metadata. The initial mapping covers keyboard,
+relative/absolute pointer, buttons, and wheel; gamepads remain direct workload
+readers. Touch and pen allocations fail this experimental admission until their
+mappings are implemented. Source retirement, dropped kernel events, excessive
+input backlog, or stalled capture fails the provider and tears down its stream.
+
+A post-creation X11 directory failure without a retained inode leaves cleanup
+unproven. Startup fails and the worker's private tmpfs must be destroyed before
+reuse. There is no same-worker retry path; unidentified or replacement paths
+must never be removed by provider cleanup.
+
+The private audio provider supervises WirePlumber 0.5.8 with a fixed `polaris`
+profile. Hardware discovery, D-Bus integration, saved routing, default-device
+fallback, and stream movement are disabled. Before launcher admission it captures
+the allocated null sink's object serial, proves that the policy process is
+attached to this private server, and verifies both stereo playback and monitor
+ports. Dynamic streams may link only to that original sink; a replacement with
+the same name does not inherit its authority. Policy exit retires the audio
+provider, which stops Pulse and policy before the PipeWire core.
+
+Each profile adds the hash-locked `wireplumber_0.5.8-1_amd64.deb` from Ubuntu's
+signed Plucky release archive. This supplemental package uses the explicit
+archive URL in its lock entry; the existing January 20 snapshot inputs retain
+their versions and hashes. Offline installation against all four locked source
+roots and runtime package sets adds only WirePlumber: its library, Lua, and
+PipeWire dependencies are already covered. Final builds remain network-free.

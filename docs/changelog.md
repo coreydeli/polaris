@@ -7,7 +7,50 @@ starts at `v1.0.0`.
 
 ## Unreleased
 
+## v1.4.7 - 2026-09-12
+
+A controller and configuration update matched with Nova v1.4.7. The virtual DualSense maps the way a real one does, and the per-user configuration directory stops being created in a state Polaris then refuses to use. Existing configurations and paired devices remain valid.
+
+- Corrects the virtual DualSense's button and stick mapping. Polaris advertised the HID version a USB DualSense reports while creating the pad on the Bluetooth bus, and that combination matches no entry in the controller database clients read, so they fell back to a layout from before the kernel's PlayStation driver existed: face buttons rotated, and the triggers and the right stick swapped for each other. Clients that reach the pad directly were always correct, which is why the same pad could behave in one game and not the next (#660, #634)
+- Rests the virtual DualSense with its sticks centred and its triggers released. Of the report's six axes only three were given a starting value, so a pad nobody had touched reported both sticks pushed hard left and the right trigger half pulled until the first real input arrived (#660)
+- Repairs a per-user configuration directory that a privileged run left owned by root. `--setup-host` now hands it back to the account Polaris runs as, walking it without following symbolic links, and corrects its permissions as well as its owner (#654, #637)
+- Stops creating that directory in a state Polaris then refuses to use. It is narrowed to the owning account when it is created rather than inheriting whatever the account's umask allows, which on common desktop defaults left it writable by its group and made saving credentials fail from the first run (#659, #637)
+- Names the directory that actually refused, and the remedy that matches the fault. The message reported the directory above the one it had inspected, so it paired one directory's path with another's permissions, and it only ever offered to correct ownership even when ownership was already right (#663, #637)
+- Says which driver was running when the hardware encoder did not start, so a host that silently drops to software encoding names the driver version it found instead of leaving the reason in a discarded log line (#657, #650)
+- Explains that unreadable saved authorization state is not fatal: the host clears it, continues with a new identity, and says that any client paired before then has to pair again (#663)
+- Stops building two files without optimisation on compilers that no longer need the workaround, after measuring that the internal compiler error it existed for is gone (#656)
+- Continues the experimental multiseat foundation, still default off and unreachable in production: a negotiated media contract between worker and controller, and the DRM primary node a nested gamescope seat needs in its device catalog (#648, #662)
+- Keeps exactly `Polaris-arch-x86_64.pkg.tar.zst`, `Polaris-fedora44-x86_64.rpm`, `Polaris-steamos3.8-x86_64.pkg.tar.zst`, and `Polaris-ubuntu24.04-x86_64.deb` as the official package assets
+
+## v1.4.6 - 2026-09-11
+
+A correctness update for Linux hosts that stream a private display, and for three failures that used to happen in silence. A game's stored virtual-display preference no longer overrides a host that already provides the session's display, a paused session no longer changes what the host recommends to other clients, and an encoder, a driver reading and a refused directory now each say what went wrong. Existing configurations and paired devices remain valid.
+
+- Stops an app's stored virtual-display preference, or a client that never locked its topology, from moving a private headless host onto the host virtual display. A locked client choice, the paired always-virtual default, an explicit session stream mode and desktop mirroring all still win, so the mode stays reachable by asking for it rather than by inheriting it (#649)
+- Keeps a session-scoped display override out of the topology the host recommends to other clients. The override stays in force for its own session, including the whole paused-session resume window, but is no longer read back as the host's own default, so one client's choice can no longer become the next client's recommendation (#649)
+- Reports when a host virtual display backend replaces an explicitly configured capture backend for that session, instead of substituting it silently (#649)
+- Records which input moved a session off the host's own topology, so a silent promotion no longer reads in the log exactly like a deliberate choice (#651)
+- Adds a contract over the launch topology resolver: across every registered path and every combination of the resolver's inputs, a private host must either defer to its own default or return a topology the caller named (#651)
+- Rejects nvidia-smi's failure banner as a driver version. The banner was stored in the driver cache, which is keyed on the tool's path and modification time rather than its content, so a single bad reading survived restarts and stopped the encoder cache from noticing a driver change; an already-poisoned cache now heals itself
+- Names the directory that refused to hold private state, along with its owner, its mode, the user Polaris runs as, and the remedy. One run under sudo leaves the per-user configuration directory owned by root, after which saving credentials fails permanently, and since v1.4.5 it failed with nothing in the log at all
+- Keeps libav errors at the default verbosity instead of silencing them. An encoder that cannot start because the graphics driver is older than the linked FFmpeg's nvenc API now reports both versions, rather than falling back to software encoding without explanation
+- Keeps exactly `Polaris-arch-x86_64.pkg.tar.zst`, `Polaris-fedora44-x86_64.rpm`, `Polaris-steamos3.8-x86_64.pkg.tar.zst`, and `Polaris-ubuntu24.04-x86_64.deb` as the official package assets
+
+## v1.4.5 - 2026-09-10
+
+A Bazzite and Live Tuning update matched with Nova v1.4.5. Live Tuning is one saved host preference that every console surface and paired client reads the same way, Bazzite Desktop launches prepare capture before the stream starts, hosts running a Steam Game Mode session learn why they go offline and how headless boot keeps them reachable, and `--setup-host` reports it. The supported Bazzite RPM path was exercised end to end on an NVIDIA Open host with a Retroid Pocket 6. Existing configurations and paired devices remain valid.
+
+- Reworks the supported Bazzite RPM guide around staged installation, explicit reboot, local-RPM replacement, and boot-independent service setup; moves the composefs KMS copy into an optional section and keeps Game Mode hardware limits and the withdrawn system extension explicit
+- Shares one saved Live Tuning preference across Quick Controls, the Audio/Video settings page, paired session status, and session events, independent of AI provider sign-in. Clients see the requested bitrate separately from the encoder-confirmed rate, with waiting, measuring, applying, adjusting, stable, unavailable, and unknown states; turning Live Tuning off holds the last confirmed bitrate, and an explicit fixed bitrate supersedes adaptive ownership (#641)
+- Prepares desktop capture before stream startup on Bazzite, normalises the resume policy, keeps native audio ownership with the session, and corrects CUDA conversion ownership and upload ordering, so a Bazzite Desktop launch or resume no longer prepares the portal too late or inherits unsuitable display semantics (#639)
+- Refreshes display capabilities once the host is back after Save + Apply, so Host Virtual Display no longer stays unavailable on the settings page because of a stale capability response; late responses cannot overwrite the new snapshot and Reset Changes keeps the refreshed capabilities (#642, #633)
+- Keeps DualSense reports in order: a periodic report can no longer land after newer button updates and replay stale input; the sender and reader threads are retained and joined, and descriptors close if construction fails (#643, #634)
+- Preserves the configured physical identity of every virtual input device on all nine uinput creation paths and keeps descriptor ownership until destruction, so reserved-device udev rules identify them reliably (#644, #494)
+- Protects unused encoder capability probes from a null-frame flush, adds actual submission/teardown regressions for the first-launch Vulkan crash, and keeps Doctor from telling a stable AMD VA-API/SHM user to switch to Auto with a promised fallback (#628)
+- Repins native PipeWire session audio when the stream omits its PID by resolving its owning client, while preserving session markers, unrelated desktop audio, and the no-default-sink-claim setting (#629)
 - Recognises hosts with a Steam Game Mode session (SteamOS, Bazzite deck images, CachyOS handheld edition, other gamescope-session hosts). `--setup-host` says why Polaris goes offline when the host leaves Desktop Mode and prints the headless-boot command, `/api/stats/system` reports `game_mode_host` with Game Mode-aware boot readiness and display-session guidance, and the console names a running Game Mode session instead of asking for a desktop restart. New handhelds guide with the Game Mode validation recipe (#626)
+- Adds the experimental multiseat worker foundation (default off and unwired in production), a maintained offline system-extension assembler with locked inputs, a read-only Bazzite host observer for local acceptance runs, and steadier Doctor CI fixtures (#640, #645, #646)
+- Keeps exactly `Polaris-arch-x86_64.pkg.tar.zst`, `Polaris-fedora44-x86_64.rpm`, `Polaris-steamos3.8-x86_64.pkg.tar.zst`, and `Polaris-ubuntu24.04-x86_64.deb` as the official package assets
 
 ## v1.4.4 - 2026-09-06
 

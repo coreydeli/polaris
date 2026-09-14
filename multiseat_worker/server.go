@@ -348,6 +348,37 @@ func (server *workerServer) serveConnection(
 			if err := writer.send(messageInputAck, nil); err != nil {
 				return
 			}
+		case messageMediaConfigAck, messageRequestIDR, messageInvalidateReferenceFrames:
+			// The contract messages reach the encoder through the same gate as
+			// input: the exact control channel of an attached data plane.
+			if selectedChannel != channelControl || !attached ||
+				nilRuntimeInterface(server.dataPlane) {
+				return
+			}
+			control := routedMediaControl{
+				Identity: server.config.Identity,
+				Message:  value.Message,
+			}
+			if value.Message == messageInvalidateReferenceFrames {
+				span, err := parseFrameRange(value.Payload)
+				if err != nil {
+					return
+				}
+				control.Range = span
+			}
+			routeContext, cancelRoute := context.WithTimeout(
+				connectionContext,
+				dataPlaneRouteTimeout,
+			)
+			err := server.dataPlane.RouteMediaControl(routeContext, control)
+			cancelRoute()
+			if err != nil {
+				server.failDataPlane("media control")
+				return
+			}
+			if err := writer.send(messageMediaControlAck, nil); err != nil {
+				return
+			}
 		case messageShutdown:
 			if selectedChannel != channelControl {
 				return
@@ -417,24 +448,31 @@ func (server *workerServer) close() {
 }
 
 func probeWorkerSocket(
+	parent context.Context,
 	path string,
 	config workerConfig,
 	capability [capabilitySize]byte,
 	selectedChannel channel,
 	expectedUID uint32,
 ) error {
-	connection, err := net.DialUnix(
-		"unix",
-		nil,
-		&net.UnixAddr{Name: path, Net: "unix"},
-	)
+	ctx, cancel := context.WithTimeout(parent, handshakeTimeout)
+	defer cancel()
+	raw, err := (&net.Dialer{}).DialContext(ctx, "unix", path)
 	if err != nil {
 		return errors.New("worker IPC health connection failed")
 	}
-	defer connection.Close()
-	if err := connection.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+	defer raw.Close()
+	connection, ok := raw.(*net.UnixConn)
+	if !ok {
+		return errors.New("worker IPC health connection type invalid")
+	}
+	deadline, _ := ctx.Deadline()
+	if err := connection.SetDeadline(deadline); err != nil {
 		return errors.New("worker IPC health deadline cannot be set")
 	}
+	// Arm after the normal deadline: cancellation cannot be overwritten by it.
+	stopCancellation := context.AfterFunc(ctx, func() { _ = connection.SetDeadline(time.Now()) })
+	defer stopCancellation()
 	uid, err := peerUID(connection)
 	if err != nil || uid != expectedUID {
 		return errors.New("worker IPC health peer was rejected")
@@ -507,7 +545,7 @@ func probeWorkerSocket(
 	if err != nil || heartbeat.Message != messageHeartbeatAck || heartbeat.Sequence != 3 {
 		return errors.New("worker IPC health heartbeat was rejected")
 	}
-	return nil
+	return ctx.Err()
 }
 
 func newWorkerServer(

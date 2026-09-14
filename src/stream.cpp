@@ -14,11 +14,11 @@
 // lib includes
 #include <boost/endian/arithmetic.hpp>
 #include <openssl/err.h>
+#include <rs.h>
 
 extern "C" {
   // clang-format off
 #include <moonlight-common-c/src/Limelight-internal.h>
-#include "rswrapper.h"
   // clang-format on
 }
 
@@ -37,6 +37,8 @@ extern "C" {
 #ifdef __linux__
   #include "platform/linux/multiseat_moonlight_activation.h"
   #include "platform/linux/multiseat_moonlight_live_session.h"
+  #include "platform/linux/multiseat_worker_launch_connection.h"
+  #include "platform/linux/multiseat_worker_media_pump.h"
   #include "platform/linux/session_media.h"
 #endif
 #include "process.h"
@@ -464,8 +466,19 @@ namespace stream {
     control_server_t control_server;
   };
 
+#ifdef __linux__
+  struct worker_connection_owner_t {
+    explicit worker_connection_owner_t(
+      std::shared_ptr<multiseat::input::worker_launch_connection_t> connection
+    ): connection(std::move(connection)) {}
+    ~worker_connection_owner_t() { connection->retire(); }
+    const std::shared_ptr<multiseat::input::worker_launch_connection_t> connection;
+  };
+#endif
+
   struct session_t {
     config_t config;
+    std::shared_ptr<void> capture_preparation;
 
     safe::mail_t mail;
 
@@ -479,6 +492,17 @@ namespace stream {
     mutable std::mutex multiseat_input_binding_mutex;
     bool multiseat_input_selection_closed = false;
     bool multiseat_launch_finished = false;
+    std::unique_ptr<worker_connection_owner_t> worker_connection;
+    // Never downgraded to host capture, including after reservation retirement.
+    bool worker_connection_required = false;
+    std::shared_ptr<const std::atomic_bool> launch_worker_connection_required;
+#endif
+
+#ifdef __linux__
+    // Set once the audio socket knows its peer. The worker's media arrives on
+    // one channel read by the video thread, which can reach an audio frame
+    // before the audio thread has learned where to send it.
+    std::atomic_bool audio_peer_known {false};
 #endif
 
     std::thread audioThread;
@@ -578,6 +602,11 @@ namespace stream {
     safe::signal_t controlEnd;
 
     std::atomic<session::state_e> state;
+
+    // Declared last so destruction drains active sends before any session
+    // fields are destroyed, including on an aborted start. Queued packets
+    // retain only a permanently closed destination after this owner retires.
+    stream_packets::owner_t packet_owner {this};
   };
 
 #ifdef __linux__
@@ -594,9 +623,12 @@ namespace stream {
     }
 
     void close_multiseat_input(session_t &session) noexcept {
+      session.packet_owner.close();
       bool finish_launch = false;
       {
         std::scoped_lock lock {session.multiseat_input_binding_mutex};
+        session.multiseat_input_selection_closed = true;
+        session.worker_connection.reset();
         if (!session.multiseat_input) {
           return;
         }
@@ -1707,7 +1739,11 @@ namespace stream {
 
       frame_network_latency_logger.first_point_now();
 
-      auto session = (session_t *) packet->channel_data;
+      auto delivery = packet->channel_data.acquire();
+      if (!delivery) {
+        continue;
+      }
+      auto session = static_cast<session_t *>(delivery.get());
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
@@ -1793,7 +1829,7 @@ namespace stream {
       // D = 255 / (1 + F)
       // multiplied by 100 since F is the percentage as an integer:
       // D = (255 * 100) / (100 + F)
-      auto max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
+      auto max_data_shards_per_fec_block = (RS8_DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
 
       // Compute the number of FEC blocks needed for this frame using the block size and max shards
       auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
@@ -1900,6 +1936,7 @@ namespace stream {
 
         auto blockIndex = 0;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
+          if (delivery.cancelled()) return;
           auto packets = (current_payload.size() + (blocksize - 1)) / blocksize;
 
           for (int x = 0; x < packets; ++x) {
@@ -1938,6 +1975,7 @@ namespace stream {
             peer_address,
             session->video.peer.port(),
             session->localAddress,
+            delivery.cancellation(),
           };
 
           size_t next_shard_to_send = 0;
@@ -1954,6 +1992,7 @@ namespace stream {
 
           // set FEC info now that we know for sure what our percentage will be for this frame
           for (auto x = 0; x < shards.size(); ++x) {
+            if (delivery.cancelled()) return;
             auto *inspect = (video_packet_raw_t *) shards.data(x);
 
             inspect->packet.fecInfo =
@@ -2001,8 +2040,11 @@ namespace stream {
                              ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
 
                 auto now = std::chrono::steady_clock::now();
-                if (now < due) {
-                  timer->sleep_for(due - now);
+                while (now < due) {
+                  if (delivery.cancelled()) return;
+                  timer->sleep_for(std::min(std::chrono::duration_cast<std::chrono::nanoseconds>(due - now),
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(10ms)));
+                  now = std::chrono::steady_clock::now();
                 }
 
                 ratecontrol_group_packets_sent = 0;
@@ -2015,9 +2057,11 @@ namespace stream {
               frame_send_batch_latency_logger.first_point_now();
               // Use a batched send if it's supported on this platform
               if (!platf::send_batch(batch_info)) {
+                if (delivery.cancelled()) return;
                 // Batched send is not available, so send each packet individually
                 BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
                 for (auto y = 0; y < current_batch_size; y++) {
+                  if (delivery.cancelled()) return;
                   auto send_info = platf::send_info_t {
                     shards.prefix(next_shard_to_send + y),
                     shards.prefixsize,
@@ -2027,6 +2071,7 @@ namespace stream {
                     peer_address,
                     session->video.peer.port(),
                     session->localAddress,
+                    delivery.cancellation(),
                   };
 
                   platf::send(send_info);
@@ -2096,7 +2141,11 @@ namespace stream {
       }
 
       TUPLE_2D_REF(channel_data, packet_data, *packet);
-      auto session = (session_t *) channel_data;
+      auto delivery = channel_data.acquire();
+      if (!delivery) {
+        continue;
+      }
+      auto session = static_cast<session_t *>(delivery.get());
 
       auto sequenceNumber = session->audio.sequenceNumber;
       auto timestamp = session->audio.timestamp;
@@ -2130,8 +2179,10 @@ namespace stream {
           peer_address,
           session->audio.peer.port(),
           session->localAddress,
+          delivery.cancellation(),
         };
         platf::send(send_info);
+        if (delivery.cancelled()) continue;
 
         auto &fec_packet = session->audio.fec_packet;
         // initialize the FEC header at the beginning of the FEC block
@@ -2145,6 +2196,7 @@ namespace stream {
           reed_solomon_encode(rs.get(), shards_p.begin(), RTPA_TOTAL_SHARDS, bytes);
 
           for (auto x = 0; x < RTPA_FEC_SHARDS; ++x) {
+            if (delivery.cancelled()) break;
             fec_packet.rtp.sequenceNumber = util::endian::big<std::uint16_t>(sequenceNumber + x + 1);
             fec_packet.fecHeader.fecShardIndex = x;
 
@@ -2157,6 +2209,7 @@ namespace stream {
               peer_address,
               session->audio.peer.port(),
               session->localAddress,
+              delivery.cancellation(),
             };
             platf::send(send_info);
             BOOST_LOG(verbose) << "Audio FEC ["sv << (sequenceNumber & ~(RTPA_DATA_SHARDS - 1)) << ' ' << x << "] ::  send..."sv;
@@ -2192,6 +2245,13 @@ namespace stream {
       return -1;
     }
 
+    // Native send calls must never block before they can observe retirement.
+    ctx.video_sock.native_non_blocking(true, ec);
+    if (ec) {
+      BOOST_LOG(error) << "Could not make the video socket nonblocking: " << ec.message();
+      return -1;
+    }
+
     // Set video socket send buffer size (SO_SENDBUF) to 1MB
     try {
       ctx.video_sock.set_option(boost::asio::socket_base::send_buffer_size(1024 * 1024));
@@ -2210,6 +2270,13 @@ namespace stream {
     if (ec) {
       BOOST_LOG(fatal) << "Couldn't open socket for Audio server: "sv << ec.message();
 
+      return -1;
+    }
+
+    // Native send calls must never block before they can observe retirement.
+    ctx.audio_sock.native_non_blocking(true, ec);
+    if (ec) {
+      BOOST_LOG(error) << "Could not make the audio socket nonblocking: " << ec.message();
       return -1;
     }
 
@@ -2325,6 +2392,90 @@ namespace stream {
     return -1;
   }
 
+#ifdef __linux__
+  /**
+   * Carry this session's worker media instead of capturing the host.
+   *
+   * The worker encodes for exactly this client, so its frames enter the same
+   * queues the host's own encoder feeds, stamped with this stream's packet
+   * destination. From there the ordinary broadcast path does the rest: one
+   * routing rule, one place that owns delivery. Every way this ends, ends the
+   * stream, because a worker session has no host capture to fall back to.
+   */
+  void worker_media_thread(session_t *session) {
+    const auto connection =
+      session->worker_connection->connection->stream_connection(session->session_generation);
+    auto video_packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
+    const auto destination = session->packet_owner.destination();
+    auto shutdown_event = session->mail->event<bool>(mail::shutdown);
+    auto idr_events = session->mail->event<bool>(mail::idr);
+    auto invalidate_events =
+      session->mail->event<std::pair<std::int64_t, std::int64_t>>(mail::invalidate_ref_frames);
+    std::uint64_t dropped_before_audio_peer = 0;
+
+    const multiseat::media::delivery_sinks_t sinks {
+      .video = [&](std::vector<std::uint8_t> &&bytes, const std::int64_t index, const bool idr) {
+        auto packet = std::make_unique<video::packet_raw_generic>(std::move(bytes), index, idr);
+        packet->channel_data = destination;
+        video_packets->raise(std::move(packet));
+      },
+      .audio = [&](std::vector<std::uint8_t> &&bytes) {
+        // An audio frame that predates the client's audio socket has nowhere
+        // to go, and the host's own capture has the same shape: it starts only
+        // after that socket's ping. Dropping the first few is what that costs.
+        if (!session->audio_peer_known.load(std::memory_order_acquire)) {
+          ++dropped_before_audio_peer;
+          return;
+        }
+        audio::buffer_t buffer {bytes.size()};
+        std::copy(bytes.begin(), bytes.end(), std::begin(buffer));
+        audio_packets->raise(destination, std::move(buffer));
+      },
+    };
+    const multiseat::media::host_requests_t requests {
+      .stop_requested = [&] {
+        return !shutdown_event->running() || shutdown_event->peek();
+      },
+      .take_idr_request = [&] {
+        return static_cast<bool>(idr_events->try_pop());
+      },
+      .take_invalidation = [&]() -> std::optional<std::pair<std::int64_t, std::int64_t>> {
+        if (auto range = invalidate_events->try_pop()) {
+          return *range;
+        }
+        return {};
+      },
+    };
+    const multiseat::media::expected_media_t expected {
+      .width = static_cast<std::uint16_t>(session->config.monitor.width),
+      .height = static_cast<std::uint16_t>(session->config.monitor.height),
+      .fps = static_cast<std::uint32_t>(session->config.monitor.framerate),
+      .video_format = session->config.monitor.videoFormat,
+      .audio_channels = static_cast<std::uint8_t>(session->config.audio.channels),
+    };
+
+    BOOST_LOG(info) << "Carrying worker media for this session"sv;
+    const auto report = multiseat::media::run(connection, expected, sinks, requests);
+    const auto summary = [&] {
+      return std::string {multiseat::media::describe(report.status)} +
+             (report.detail.empty() ? std::string {} : " ("s + report.detail + ")"s) +
+             ": "s + std::to_string(report.video_frames) + " video frames, "s +
+             std::to_string(report.audio_frames) + " audio frames, "s +
+             std::to_string(report.discontinuities) + " discontinuities, "s +
+             std::to_string(report.idr_requests) + " keyframe requests"s +
+             (dropped_before_audio_peer == 0 ? std::string {} :
+                ", "s + std::to_string(dropped_before_audio_peer) +
+                  " audio frames dropped before the client's audio socket answered"s);
+    };
+    if (multiseat::media::ended_cleanly(report.status)) {
+      BOOST_LOG(info) << "Worker media ended: "sv << summary();
+    } else {
+      BOOST_LOG(error) << "Worker media failed: "sv << summary();
+    }
+  }
+#endif
+
   void videoThread(session_t *session) {
     auto fg = util::fail_guard([&]() {
       session::stop(*session);
@@ -2342,8 +2493,14 @@ namespace stream {
     auto address = session->video.peer.address();
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
+#ifdef __linux__
+    if (session->worker_connection) {
+      worker_media_thread(session);
+      return;
+    }
+#endif
     BOOST_LOG(debug) << "Start capturing Video"sv;
-    video::capture(session->mail, session->config.monitor, session);
+    video::capture(session->mail, session->config.monitor, session->packet_owner.destination());
   }
 
   void audioThread(session_t *session) {
@@ -2363,8 +2520,18 @@ namespace stream {
     auto address = session->audio.peer.address();
     session->audio.qos = platf::enable_socket_qos(ref->audio_sock.native_handle(), address, session->audio.peer.port(), platf::qos_data_type_e::audio, session->config.audioQosType != 0);
 
+#ifdef __linux__
+    session->audio_peer_known.store(true, std::memory_order_release);
+    if (session->worker_connection) {
+      // One worker channel carries both, and the video thread reads it. This
+      // thread still owns the audio socket's ping and QoS, so it stays for the
+      // life of the session rather than ending it by returning.
+      session->mail->event<bool>(mail::shutdown)->view();
+      return;
+    }
+#endif
     BOOST_LOG(debug) << "Start capturing Audio"sv;
-    audio::capture(session->mail, session->config.audio, session);
+    audio::capture(session->mail, session->config.audio, session->packet_owner.destination());
   }
 
   namespace session {
@@ -2401,11 +2568,44 @@ namespace stream {
     }
 
 #ifdef POLARIS_TESTS
+    std::mutex host_start_test_mutex;
+    std::function<void()> host_start_abort_hook;
+
+    void set_host_start_abort_hook_for_tests(std::function<void()> hook) {
+      std::scoped_lock lock {host_start_test_mutex};
+      host_start_abort_hook = std::move(hook);
+    }
+
+    unsigned exchange_active_count_for_tests(unsigned count) {
+      return running_sessions.exchange(count);
+    }
+
+    bool abort_host_start_for_tests() {
+      std::function<void()> hook;
+      {
+        std::scoped_lock lock {host_start_test_mutex};
+        hook = host_start_abort_hook;
+      }
+      if (!hook) return false;
+      hook();
+      return true;
+    }
+
+    stream_packets::destination_t packet_destination_for_tests(session_t &session) {
+      return session.packet_owner.destination();
+    }
+
     void set_state_for_tests(session_t &session, state_e state) {
       session.state.store(state, std::memory_order_relaxed);
     }
 
 #ifdef __linux__
+    std::shared_ptr<multiseat::input::worker_launch_connection_t>
+    worker_connection_for_tests(const session_t &session) {
+      std::scoped_lock lock {session.multiseat_input_binding_mutex};
+      return session.worker_connection ? session.worker_connection->connection : nullptr;
+    }
+
     bool route_multiseat_input_for_tests(
       session_t &session,
       std::span<const std::uint8_t> packet
@@ -2436,6 +2636,10 @@ namespace stream {
 
     std::uint64_t launch_lifecycle_generation(const session_t& session) {
       return session.launch_lifecycle_generation;
+    }
+
+    std::uint64_t generation(const session_t &session) {
+      return session.session_generation;
     }
 
     bool uuid_match(const session_t &session, const std::string_view& uuid) {
@@ -2493,15 +2697,26 @@ namespace stream {
       std::shared_ptr<
         multiseat::input::moonlight_controller_feedback_hub_t
       > feedback_hub,
-      bool controller_feedback
+      bool controller_feedback,
+      multiseat::input::worker_connection_selection_t worker_connection
     ) {
       std::scoped_lock lock {session.multiseat_input_binding_mutex};
       if (session.state.load(std::memory_order_acquire) != state_e::STOPPED ||
-          session.multiseat_input_selection_closed) {
+          session.multiseat_input_selection_closed || !session.packet_owner.destination().acquire()) {
         return multiseat_input_bind_status_e::invalid_session_state;
       }
       if (session.multiseat_input) {
         return multiseat_input_bind_status_e::already_bound;
+      }
+      if (worker_connection.required != static_cast<bool>(worker_connection.connection) ||
+          (!worker_connection.required && session.launch_worker_connection_required &&
+           session.launch_worker_connection_required->load()) ||
+          (worker_connection.required &&
+           (!(session.permission & crypto::PERM::_allow_view) ||
+            !worker_connection.connection->matches_stream(session.launch_session_id,
+              session.launch_lifecycle_generation, session.device_uuid, handle,
+              session.launch_worker_connection_required)))) {
+        return multiseat_input_bind_status_e::worker_connection_rejected;
       }
 
       auto feedback_queue = session.control.feedback_queue;
@@ -2536,7 +2751,19 @@ namespace stream {
         return multiseat_input_bind_status_e::open_failed;
       }
 
+      std::unique_ptr<worker_connection_owner_t> worker_owner;
+      if (worker_connection.required) {
+        if (!worker_connection.connection->try_claim(session.session_generation)) {
+          return multiseat_input_bind_status_e::worker_connection_rejected;
+        }
+        auto retire_failed_claim = util::fail_guard([&] { worker_connection.connection->retire(); });
+        worker_owner = std::make_unique<worker_connection_owner_t>(worker_connection.connection);
+        retire_failed_claim.disable();
+      }
+
       session.multiseat_input = std::move(opened.session);
+      session.worker_connection_required = worker_connection.required;
+      session.worker_connection = std::move(worker_owner);
       BOOST_LOG(info) << "Session: Bound authenticated multiseat input for ["sv
                       << session.device_name << "]"sv;
       return multiseat_input_bind_status_e::bound;
@@ -2546,10 +2773,20 @@ namespace stream {
       std::scoped_lock lock {session.multiseat_input_binding_mutex};
       return static_cast<bool>(session.multiseat_input);
     }
+
+    bool multiseat_input_bound_to(const session_t &session, std::uint64_t generation) {
+      std::scoped_lock lock {session.multiseat_input_binding_mutex};
+      return generation != 0 && session.session_generation == generation &&
+             session.multiseat_input && session.multiseat_input->accepting() &&
+             !session.multiseat_input_selection_closed &&
+             (!session.worker_connection_required ||
+              (session.worker_connection && session.worker_connection->connection->bound_to(generation)));
+    }
 #endif
 
     void stop(session_t &session) {
       while_starting_do_nothing(session.state);
+      session.packet_owner.close();
 #ifdef __linux__
       close_multiseat_input(session);
 #endif
@@ -2564,6 +2801,7 @@ namespace stream {
 
     void graceful_stop(session_t& session) {
       while_starting_do_nothing(session.state);
+      session.packet_owner.close();
 #ifdef __linux__
       close_multiseat_input(session);
 #endif
@@ -2599,6 +2837,7 @@ namespace stream {
     }
 
     void join(session_t &session) {
+      session.packet_owner.close();
 #ifdef __linux__
       close_multiseat_input(session);
 #endif
@@ -2623,6 +2862,9 @@ namespace stream {
       session.videoThread.join();
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
       session.audioThread.join();
+      // Producers are quiescent; reject queued packets and wait for a send
+      // already admitted on either shared broadcaster before retiring state.
+      session.packet_owner.close_and_wait();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
       // Reset input on session stop to avoid stuck repeated keys
@@ -2668,6 +2910,13 @@ namespace stream {
       // If this is the last session, invoke the platform callbacks
       auto remaining = --running_sessions;
       BOOST_LOG(info) << "Session ended for ["sv << session.device_name << "] [active sessions: "sv << remaining << "]"sv;
+
+      // The client told us which pad it wanted, after the pad it got had already been
+      // created. Keep it, so the next launch from this device starts the right one.
+      nvhttp::remember_client_controller_type(
+        session.device_uuid,
+        stream_stats::client_declared_controller_type()
+      );
 
       bool temporary_authorization_expired = false;
       if (session.temporary_authorization ||
@@ -2726,6 +2975,12 @@ namespace stream {
         stream_generation_boundary_mutex
       };
 
+#ifdef __linux__
+      auto abort_multiseat_start = util::fail_guard([&session]() {
+        close_multiseat_input(session);
+      });
+#endif
+
       // Enforce max_sessions limit
       auto max_sessions = config::stream.max_sessions;
       if (max_sessions > 0) {
@@ -2738,6 +2993,8 @@ namespace stream {
       }
 
 #ifdef __linux__
+      // A launch that requires a worker is checked after activation, below,
+      // where whether one was actually bound is known.
       const auto multiseat_activation =
         multiseat::input::activate_registered_moonlight_session(session);
       switch (multiseat_activation) {
@@ -2756,17 +3013,36 @@ namespace stream {
             << static_cast<int>(multiseat_activation) << ')';
           return -1;
       }
-      auto abort_multiseat_start = util::fail_guard([&session]() {
-        close_multiseat_input(session);
-      });
       {
         std::scoped_lock lock {session.multiseat_input_binding_mutex};
+        // A selected worker must never fall through to singleton host capture,
+        // so a session that requires one starts only with its reservation in
+        // hand, and only when that reservation still answers for this stream.
+        // The launch's own requirement counts too: it outlives a gate that was
+        // retired, or a selection that never reached this allocation.
+        const bool requires_worker =
+          session.worker_connection_required ||
+          (session.launch_worker_connection_required &&
+           session.launch_worker_connection_required->load());
+        if (requires_worker &&
+            (!session.worker_connection ||
+             !session.worker_connection->connection->stream_connection(session.session_generation)
+                .connected())) {
+          BOOST_LOG(warning) << "Refusing stream: its worker connection is not available"sv;
+          return -1;
+        }
+#ifdef POLARIS_TESTS
+        if (abort_host_start_for_tests()) return -1;
+#endif
         session.multiseat_input_selection_closed = true;
         if (!session.multiseat_input) {
           session.input = input::alloc(session.mail);
         }
       }
 #else
+#ifdef POLARIS_TESTS
+      if (abort_host_start_for_tests()) return -1;
+#endif
       session.input = input::alloc(session.mail);
 #endif
 
@@ -2822,9 +3098,7 @@ namespace stream {
       stream_stats::update_session_targets(
         session.requested_fps > 0 ? static_cast<double>(session.requested_fps) / 1000.0 : 0.0,
         session.session_target_fps > 0 ? static_cast<double>(session.session_target_fps) / 1000.0 : 0.0,
-        session.config.monitor.encodingFramerate > 1000 ?
-          static_cast<double>(session.config.monitor.encodingFramerate) / 1000.0 :
-          static_cast<double>(session.config.monitor.encodingFramerate),
+        av_q2d(video::encoding_framerate_to_rational(session.config.monitor)),
         session.pacing_policy,
         session.optimization_source,
         session.optimization_confidence,
@@ -2898,11 +3172,15 @@ namespace stream {
 
     std::shared_ptr<session_t> alloc(config_t &config, rtsp_stream::launch_session_t &launch_session) {
       auto session = std::make_shared<session_t>();
+      session->capture_preparation = launch_session.capture_preparation.load();
 
       auto mail = std::make_shared<safe::mail_raw_t>();
 
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
+#ifdef __linux__
+      session->launch_worker_connection_required = launch_session.worker_connection_requirement();
+#endif
       session->launch_lifecycle_generation =
         launch_session.lifecycle_generation.value_or(0);
       session->device_name = launch_session.device_name;

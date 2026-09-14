@@ -127,6 +127,8 @@ namespace stream_stats {
   };
 
   struct stats_t {
+    std::uint64_t session_generation = 0;
+    std::string app_session_id;
     // Stream state
     bool streaming = false;
     std::string client_name;
@@ -149,7 +151,16 @@ namespace stream_stats {
     platf::frame_residency_e encode_target_residency = platf::frame_residency_e::unknown;
     platf::frame_format_e encode_target_format = platf::frame_format_e::unknown;
     int dynamic_range = 0;
+    /// An LI_CTYPE_* the client declared after the pad had already been created, so it was
+    /// too late to honour. Zero when no arrival was dropped.
+    int client_declared_controller_type = 0;
     bool display_hdr = false;
+    /// Why the resolved launch profile turned HDR off, when it did. Empty when policy did
+    /// not decide it. Survives the end of the stream: it describes the host's saved
+    /// settings for a device, not the session that just ended.
+    std::string hdr_policy_reason;
+    bool hdr_policy_hdr = false;
+    std::string hdr_policy_device;
     bool hdr_metadata_available = false;
     bool stream_hdr_enabled = false;
     std::string color_coding;
@@ -734,6 +745,24 @@ namespace stream_stats {
    * @param stream_hdr_enabled Whether Polaris is advertising true HDR for the stream.
    * @param color_coding Human-readable color coding label.
    */
+  /**
+   * @brief Record what the resolved launch profile decided about HDR, and why.
+   * @param hdr Whether the resolved profile enabled HDR.
+   * @param reason_code The launch-profile reason code behind that value.
+   * @param device The paired device the decision was made for.
+   */
+  /**
+   * @brief Record the controller type a client declared too late for the preallocated pad.
+   */
+  void update_client_declared_controller_type(int controller_type);
+
+  /**
+   * @brief The controller type a client declared too late, or 0.
+   */
+  int client_declared_controller_type();
+
+  void update_hdr_policy(bool hdr, const std::string &reason_code, const std::string &device);
+
   void update_hdr_state(bool display_hdr,
                         bool hdr_metadata_available,
                         bool stream_hdr_enabled,

@@ -54,6 +54,11 @@ namespace rtsp_stream {
 
     std::string device_name;
     std::string unique_id;
+    /// Controller type this client declared last time it streamed, so the pad created
+    /// before the app starts can match. Zero when nothing has been observed yet.
+    int controller_type = 0;
+    /// Whether this client has reported an HDR10-capable display of its own.
+    bool client_reports_hdr10_display = false;
     // Explicit deterministic launch preset. This is never populated from
     // Doctor history or AI output.
     std::string profile_preference = "auto";
@@ -73,6 +78,9 @@ namespace rtsp_stream {
     crypto::PERM perm;
     bool watch_only;
     bool temporary_authorization = false;
+    // Shared with an allocated stream until it adopts prepared capture. Use
+    // atomic shared_ptr operations because cancellation can race SETUP.
+    std::atomic<std::shared_ptr<void>> capture_preparation;
 
     enum class setup_state_e : std::uint8_t {
       pending,
@@ -95,6 +103,7 @@ namespace rtsp_stream {
       auto expected = setup_state.load();
       while (expected == setup_state_e::pending || expected == setup_state_e::handoff) {
         if (setup_state.compare_exchange_weak(expected, setup_state_e::cancelled)) {
+          capture_preparation.store({});
           return true;
         }
       }
@@ -103,6 +112,7 @@ namespace rtsp_stream {
 
     void cancel() {
       setup_state.store(setup_state_e::cancelled);
+      capture_preparation.store({});
     }
 
     bool is_pending() const {
@@ -116,6 +126,12 @@ namespace rtsp_stream {
 
     bool is_cancelled() const {
       return setup_state.load() == setup_state_e::cancelled;
+    }
+
+    /** Sticky across selection cancellation and every allocation of this launch. */
+    void require_worker_connection() { worker_connection_required_->store(true); }
+    std::shared_ptr<const std::atomic_bool> worker_connection_requirement() const {
+      return worker_connection_required_;
     }
 
     // Moonlight sends SETUP and PLAY over separate TCP connections, so started sessions remain admissible.
@@ -183,9 +199,16 @@ namespace rtsp_stream {
   #ifdef _WIN32
     GUID display_guid{};
   #endif
+
+  private:
+    const std::shared_ptr<std::atomic_bool> worker_connection_required_ =
+      std::make_shared<std::atomic_bool>(false);
   };
 
   bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  void cancel_pending_launch_for_client(std::string_view unique_id);
+  std::shared_ptr<launch_session_t> take_pending_launch_for_client(std::string_view unique_id);
+  void finish_cancelled_launch(const std::shared_ptr<launch_session_t> &launch);
 
   /**
    * @brief Clear state for the specified launch session.

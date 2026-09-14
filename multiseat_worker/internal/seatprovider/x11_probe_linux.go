@@ -24,6 +24,7 @@ type fixedDirectory struct {
 	ino  uint64
 	uid  uint32
 	mode uint32
+	pins artifactPins
 }
 
 func openFixedDirectory(
@@ -85,6 +86,7 @@ func (directory *fixedDirectory) verify() error {
 
 func (directory *fixedDirectory) close() {
 	if directory != nil && directory.file != nil {
+		directory.pins.close()
 		_ = directory.file.Close()
 	}
 }
@@ -113,7 +115,7 @@ func readIdentityBounded(
 	}
 	descriptor, err := syscall.Open(
 		path,
-		syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
+		syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
 		0,
 	)
 	if err != nil {

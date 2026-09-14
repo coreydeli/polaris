@@ -113,6 +113,11 @@ namespace nvhttp {
     std::string_view request_path = {}
   );
 
+  // Linearize publication with authorization mutation after an interactive wait.
+  int publish_authorized_launch(const crypto::p_named_cert_t &candidate,
+                                crypto::PERM required_permission,
+                                const std::function<bool()> &publish);
+
   /**
    * @brief Atomically mutate the shared authorization/credentials state file.
    *
@@ -195,6 +200,7 @@ namespace nvhttp {
   };
 
   enum class pairing_access_preset_t {
+    gamepad,
     standard,
     game_control,
     full
@@ -346,6 +352,20 @@ namespace nvhttp {
 
   /** Return whether the current live authorization is memory-only. */
   bool is_temporary_client_authorization(std::string_view uuid);
+
+  /**
+   * @brief Remember the controller type a paired client declared, for its next launch.
+   * @param uuid The paired client.
+   * @param controller_type An LI_CTYPE_* value.
+   * @return True when the stored value changed and was persisted.
+   */
+  bool remember_client_controller_type(std::string_view uuid, int controller_type);
+
+  /**
+   * @brief Remember that a paired client reported an HDR10-capable display.
+   * @return True when the stored value changed and was persisted.
+   */
+  bool remember_client_hdr10_display(std::string_view uuid, bool supports_hdr10_display);
 
   /**
    * @brief Remove single client.

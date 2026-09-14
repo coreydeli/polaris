@@ -6,6 +6,7 @@
 
 #include <src/config.h>
 #include <src/nvenc/nvenc_config.h>
+#include <src/private_state_file.h>
 #include <src/utility.h>
 
 TEST(ConfigParserTests, ProtocolDecimalsUseDotAndRequireTheWholeValue) {
@@ -119,4 +120,114 @@ TEST(ConfigParserTests, ZeroBackButtonTimeoutWarnsWithoutASecondsGuess) {
   EXPECT_FALSE(contains(advice, "If you meant"));
   EXPECT_TRUE(contains(advice, "0 milliseconds"));
   EXPECT_TRUE(contains(advice, "-1 to disable"));
+}
+
+TEST(ConfigParserTests, VaapiOptionsParseAndCanReturnToAutomatic) {
+  const auto initial = config::parse_vaapi_settings({
+    {"vaapi_quality", "balanced"}, {"vaapi_rc", "qvbr"}, {"vaapi_blbrc", "enabled"}, {"vaapi_strict_rc_buffer", "true"}
+  });
+  EXPECT_EQ(initial.quality, config::vaapi::quality_e::balanced);
+  EXPECT_EQ(initial.rc, config::vaapi::rc_e::qvbr);
+  EXPECT_EQ(initial.blbrc, true);
+  EXPECT_TRUE(initial.strict_rc_buffer);
+  const auto restored = config::parse_vaapi_settings({
+    {"vaapi_quality", "auto"}, {"vaapi_rc", "auto"}, {"vaapi_blbrc", "auto"}, {"vaapi_strict_rc_buffer", "false"}
+  }, initial);
+  EXPECT_EQ(restored.quality, config::vaapi::quality_e::automatic);
+  EXPECT_EQ(restored.rc, config::vaapi::rc_e::automatic);
+  EXPECT_FALSE(restored.blbrc.has_value());
+  EXPECT_FALSE(restored.strict_rc_buffer);
+  const auto invalid = config::parse_vaapi_settings({
+    {"vaapi_quality", "ultra"}, {"vaapi_rc", "unknown"}, {"vaapi_blbrc", "sometimes"}, {"vaapi_strict_rc_buffer", "unknown"}
+  }, initial);
+  EXPECT_EQ(invalid.quality, initial.quality);
+  EXPECT_EQ(invalid.rc, initial.rc);
+  EXPECT_EQ(invalid.blbrc, initial.blbrc);
+  EXPECT_EQ(invalid.strict_rc_buffer, initial.strict_rc_buffer);
+}
+
+TEST(ConfigParserTests, ConcurrentVaapiSnapshotsNeverMixSavedSettings) {
+  const auto saved = config::vaapi::snapshot();
+  auto restore = util::fail_guard([&] { config::vaapi::publish(saved); });
+  const config::vaapi::settings_t manual {
+    .strict_rc_buffer = true, .quality = config::vaapi::quality_e::quality,
+    .rc = config::vaapi::rc_e::qvbr, .blbrc = true
+  };
+  config::vaapi::publish({});
+  std::thread writer([&] {
+    for (int i = 0; i < 20000; ++i) config::vaapi::publish(i % 2 ? manual : config::vaapi::settings_t {});
+  });
+  for (int i = 0; i < 20000; ++i) {
+    const auto value = config::vaapi::snapshot();
+    const bool automatic = value.quality == config::vaapi::quality_e::automatic;
+    EXPECT_EQ(value.rc, automatic ? config::vaapi::rc_e::automatic : manual.rc);
+    EXPECT_EQ(value.strict_rc_buffer, !automatic);
+    EXPECT_EQ(value.blbrc, automatic ? std::optional<bool> {} : manual.blbrc);
+  }
+  writer.join();
+}
+
+#ifdef __linux__
+TEST(ConfigParserTests, FailedConfigWriteDoesNotPublishVaapiSettings) {
+  const auto saved = config::vaapi::snapshot();
+  const auto directory = std::filesystem::temp_directory_path() / ("polaris-vaapi-write-failure-" + std::to_string(
+    std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto restore = util::fail_guard([&] {
+    private_state_file::set_write_fault_for_tests(private_state_file::write_fault_e::none);
+    config::vaapi::publish(saved);
+    std::error_code error;
+    std::filesystem::remove_all(directory, error);
+  });
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+  std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+  const auto path = (directory / "polaris.conf").string();
+  config::vaapi::publish({});
+  ASSERT_EQ(config::write_config_with_vaapi_settings(path, ""), 0);
+  // The protected writer rejects device nodes before writing. Exercise failures
+  // after admission instead, and verify both the saved file and published state.
+  for (const auto fault : {private_state_file::write_fault_e::short_write,
+         private_state_file::write_fault_e::flush, private_state_file::write_fault_e::sync,
+         private_state_file::write_fault_e::rename}) {
+    SCOPED_TRACE(static_cast<int>(fault));
+    private_state_file::set_write_fault_for_tests(fault);
+    ASSERT_NE(config::write_config_with_vaapi_settings(path,
+      "vaapi_quality = quality\nvaapi_rc = vbr\nvaapi_blbrc = enabled\nvaapi_strict_rc_buffer = enabled\n"), 0);
+    const auto after = config::vaapi::snapshot();
+    EXPECT_EQ(after.quality, config::vaapi::quality_e::automatic);
+    EXPECT_EQ(after.rc, config::vaapi::rc_e::automatic);
+    EXPECT_FALSE(after.blbrc.has_value());
+    EXPECT_FALSE(after.strict_rc_buffer);
+    const auto persisted = private_state_file::read_secure(path, 4096);
+    ASSERT_TRUE(persisted);
+    EXPECT_TRUE(persisted.payload.empty());
+  }
+}
+#endif
+
+TEST(ConfigParserTests, SuccessfulConfigWritePublishesCompleteVaapiSettingsAndClearRestoresDefaults) {
+  const auto saved = config::vaapi::snapshot();
+  const auto directory = std::filesystem::temp_directory_path() / ("polaris-vaapi-config-" + std::to_string(
+    std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto restore = util::fail_guard([&] {
+    config::vaapi::publish(saved);
+    std::error_code error;
+    std::filesystem::remove_all(directory, error);
+  });
+  // The atomic writer requires an owned parent that others cannot modify.
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+  std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+  const auto path = directory / "polaris.conf";
+  ASSERT_EQ(config::write_config_with_vaapi_settings(path.string(),
+    "vaapi_quality = balanced\nvaapi_rc = qvbr\nvaapi_blbrc = enabled\nvaapi_strict_rc_buffer = enabled\n"), 0);
+  const auto after = config::vaapi::snapshot();
+  EXPECT_EQ(after.quality, config::vaapi::quality_e::balanced);
+  EXPECT_EQ(after.rc, config::vaapi::rc_e::qvbr);
+  EXPECT_EQ(after.blbrc, true);
+  EXPECT_TRUE(after.strict_rc_buffer);
+  ASSERT_EQ(config::write_config_with_vaapi_settings(path.string(), ""), 0);
+  const auto cleared = config::vaapi::snapshot();
+  EXPECT_EQ(cleared.quality, config::vaapi::quality_e::automatic);
+  EXPECT_EQ(cleared.rc, config::vaapi::rc_e::automatic);
+  EXPECT_FALSE(cleared.blbrc.has_value());
+  EXPECT_FALSE(cleared.strict_rc_buffer);
 }

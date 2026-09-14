@@ -6,13 +6,18 @@
 
 // local includes
 #include "capture_generation.h"
+#include "encoder_probe_reuse.h"
+#include <functional>
 #include "input.h"
 #include "nvenc/nvenc_config.h"
 #include "platform/common.h"
 #include "thread_safe.h"
+#include "stream_packet_owner.h"
 #include "video_colorspace.h"
+#include "video_rate.h"
 
 #include <cstddef>
+#include <cmath>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -24,6 +29,7 @@ extern "C" {
 }
 
 struct AVPacket;
+namespace config { struct video_t; }
 
 namespace video {
 
@@ -57,9 +63,47 @@ namespace video {
     int encodingFramerate; // Requested display framerate
     bool input_only;
     capture_generation::identity_t capture_generation;
+    // Appended fields preserve positional initializers used by existing clients.
+    AVRational stream_rate {0, 1};  // RTSP stream request, before integer budget rounding
+    AVRational encode_rate {0, 1};  // Host limiter: launch rate when enabled, stream rate otherwise
+
   };
 
+  inline AVRational framerate_to_rational(const config_t &config) {
+    return rate::valid(config.stream_rate) ? config.stream_rate : rate::fraction(config.framerate, 1);
+  }
+
+  // Apply ANNOUNCE's stream request independently of the admitted launch rate.
+  // Keep the legacy integer bitrate budget and Warp fields alongside exact rates.
+  inline bool configure_announced_rates(config_t &config, int max_fps, int refresh_x100,
+                                       int launch_fps_millihertz, bool limit_framerate) {
+    const auto stream_rate = rate::from_wire(max_fps, refresh_x100);
+    if (!rate::valid(stream_rate) || launch_fps_millihertz <= 0) return false;
+    config.stream_rate = stream_rate;
+    config.encode_rate = limit_framerate ? rate::from_millihertz(launch_fps_millihertz) : stream_rate;
+    config.encodingFramerate = limit_framerate ? launch_fps_millihertz :
+      (max_fps > 1000 ? max_fps : max_fps * 1000);
+    config.framerate = max_fps > 4000 ? static_cast<int>(std::round(static_cast<float>(max_fps) / 1000)) : max_fps;
+    return true;
+  }
+
+  inline AVRational encoding_framerate_to_rational(const config_t &config) {
+    if (rate::valid(config.encode_rate)) return config.encode_rate;
+    return config.encodingFramerate > 0 ? rate::from_millihertz(config.encodingFramerate) : framerate_to_rational(config);
+  }
+
+  inline std::chrono::nanoseconds capture_frame_interval(const config_t &config) {
+    return rate::interval(framerate_to_rational(config));
+  }
+
+  inline std::chrono::nanoseconds encoding_frame_interval(const config_t &config) {
+    return rate::interval(encoding_framerate_to_rational(config));
+  }
+
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
+
+  // Complete interactive Mirror Desktop capture setup before RTSP admission.
+  bool prepare_capture_for_launch(const config_t &config, std::shared_ptr<void> &preparation);
   platf::pix_fmt_e map_pix_fmt(AVPixelFormat fmt);
 
   void free_ctx(AVCodecContext *ctx);
@@ -397,7 +441,7 @@ namespace video {
 
     // Packets can remain queued after their encoder session has been retired.
     std::shared_ptr<const std::vector<replace_t>> replacements;
-    void *channel_data = nullptr;
+    stream_packets::destination_t channel_data = nullptr;
     bool after_ref_frame_invalidation = false;
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
 
@@ -534,13 +578,13 @@ namespace video {
   void capture(
     safe::mail_t mail,
     config_t config,
-    void *channel_data
+    stream_packets::destination_t channel_data
   );
 
   void capture(
     safe::mail_t mail,
     config_t config,
-    void *channel_data,
+    stream_packets::destination_t channel_data,
     packet_queue_t packets
   );
 
@@ -583,12 +627,27 @@ namespace video {
     std::string preferred_encoder;
     std::string fallback_encoder;
     std::string selected_encoder;
+    std::string driver_version;
     std::string reason;
     bool exact_live_probe_required = false;
     bool fallback_used = false;
   };
 
   encoder_selection_info_t active_encoder_selection_info();
+
+  /**
+   * @brief The extra sentence shown when a preferred NVENC encoder did not start.
+   *
+   * Points at the libav error that names the nvenc API version the linked FFmpeg
+   * required, which is the one fact that separates "this driver is too old" from
+   * every other reason an encoder can fail to open. Empty unless NVENC was asked
+   * for, did not land, and a driver version is known.
+   */
+  std::string nvenc_fallback_detail(
+    std::string_view preferred_encoder,
+    std::string_view selected_encoder,
+    std::string_view driver_version
+  );
 
   /**
    * @brief Get the name of the currently selected encoder.
@@ -633,6 +692,17 @@ namespace video {
   bool active_encoder_runtime_supports_live_gpu_capture(const config_t &config);
 
 #ifdef POLARIS_TESTS
+  void with_capture_preparation_for_tests(
+    const std::function<bool(const config_t &, std::shared_ptr<void> &)> &prepare,
+    const std::function<void()> &body
+  );
+  /** Own the supplied codec/converter through real frame submission and teardown. */
+  std::vector<int> encode_and_destroy_avcodec_session_for_tests(
+    avcodec_ctx_t context,
+    std::unique_ptr<platf::avcodec_encode_device_t> device,
+    std::size_t frame_count
+  );
+
   int hevc_profile_for_input_for_tests(int bit_depth, int chroma_sampling_type);
 
   struct encoder_probe_cache_snapshot_t {
@@ -654,6 +724,8 @@ namespace video {
     std::string_view binary_mtime
   );
 
+  std::string parse_nvidia_driver_version_for_tests(std::string_view reported);
+
   bool write_encoder_probe_cache_for_tests(
     const std::filesystem::path &cache_path,
     std::string_view driver_version,
@@ -668,6 +740,11 @@ namespace video {
     std::string_view current_topology
   );
 
+  int probe_encoders_with_hooks_for_tests(
+    const probe_reuse::identity_t &identity,
+    const std::function<bool(encoder_t &, bool)> &validate
+  );
+  std::string encoder_probe_settings_for_tests(const config::video_t &settings);
   std::string current_encoder_topology_key_for_tests();
 
   std::chrono::milliseconds reset_display_retry_delay_for_tests(int attempt);
@@ -685,6 +762,9 @@ namespace video {
     const std::vector<std::string> &display_names,
     std::string_view requested_display_name
   );
+
+  int refresh_display_selection_for_tests(std::vector<std::string> previous, int previous_index,
+                                         std::string requested, const std::vector<std::string> &enumerated);
 
   std::optional<int> clamp_display_index_for_tests(int requested_index, std::size_t display_count);
 

@@ -7,6 +7,8 @@
  * for the Polaris cage-as-window architecture.
  */
 
+#include <gio/gio.h>
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -111,8 +113,11 @@ namespace portal {
     // cache type independent lets portal/PipeWire builds omit Wayland helpers.
     std::shared_ptr<void> kwin;
     std::shared_ptr<pipewire_capture::capture_t> capture;
+    // Non-null only while a specific HTTP launch owns unclaimed preparation.
+    std::shared_ptr<const void> prepared_token;
     int requested_width = 0;
     int requested_height = 0;
+    AVRational requested_rate {0, 1};
     platf::mem_type_e mem_type = platf::mem_type_e::system;
     capture_generation::identity_t generation;
     // Last EnumFormat preference: prefer_hdr (force ∧ dynamicRange>0) or
@@ -121,8 +126,10 @@ namespace portal {
     bool prefer_sdr = false;
 
     void clear_meta() {
+      prepared_token.reset();
       requested_width = 0;
       requested_height = 0;
+      requested_rate = {0, 1};
       mem_type = platf::mem_type_e::system;
       generation = {};
       prefer_hdr = false;
@@ -289,7 +296,8 @@ namespace portal {
     int height,
     platf::mem_type_e mem_type,
     int client_dynamic_range,
-    const capture_generation::identity_t &generation
+    const capture_generation::identity_t &generation,
+    AVRational requested_rate
   ) {
     const auto encoder_render_node = encoder_render_node_for_dmabuf(generation.adapter_name);
     std::vector<pipewire_capture::dmabuf_format_modifier_t> dmabuf_formats;
@@ -353,7 +361,10 @@ namespace portal {
       .may_use_dmabuf = may_use_dmabuf,
       .prefer_hdr_formats = prefer_hdr,
       .prefer_sdr_formats = prefer_sdr,
+      .requested_rate = requested_rate,
+      .request_fixed_rate = generation.private_runtime != "gamescope" && running_kwin_uses_fixed_rate(),
     });
+    if (session_media::teardown_in_progress() || session_media::pending_start_cancelled(session_media::pending_start_owner())) return nullptr;
     if (!local->start()) {
       return nullptr;
     }
@@ -454,7 +465,7 @@ namespace portal {
       // "failed to connect to wayland socket" until the new generation owns
       // gamescope-0. Retry a few times rather than fail the whole stream.
       for (int attempt = 1;
-           attempt <= 4 &&
+           generation.stream_mode == "gamescope_stream" && attempt <= 4 &&
            (!g_media.portal || g_media.portal->failed || !g_media.portal->ready ||
             g_media.portal->pw_node_id == 0);
            ++attempt) {
@@ -481,12 +492,43 @@ namespace portal {
     return true;
   }
 
+  static bool capture_start_cancelled() {
+    return session_media::teardown_in_progress() ||
+           session_media::pending_start_cancelled(session_media::pending_start_owner());
+  }
+
+  static bool wait_for_capture_negotiation(const std::shared_ptr<pipewire_capture::capture_t> &capture) {
+    if (!capture) return false;
+    for (int i = 0; i < 100; ++i) {
+      if (capture_start_cancelled()) {
+        capture->stop();
+        return false;
+      }
+      if (capture->negotiated()) return true;
+      if (!capture->running() && !capture->retry_rate_negotiation(capture_start_cancelled)) break;
+      std::this_thread::sleep_for(100ms);
+    }
+    if (capture_start_cancelled()) {
+      capture->stop();
+      return false;
+    }
+    return capture->negotiated();
+  }
+
+#ifdef POLARIS_TESTS
+  bool wait_for_capture_negotiation_for_tests(const std::shared_ptr<pipewire_capture::capture_t> &capture) {
+    return wait_for_capture_negotiation(capture);
+  }
+#endif
+
   static std::shared_ptr<pipewire_capture::capture_t> ensure_global_capture(
     int width,
     int height,
     platf::mem_type_e mem_type,
     int client_dynamic_range,
-    const capture_generation::identity_t &generation
+    const capture_generation::identity_t &generation,
+    AVRational requested_rate,
+    const std::shared_ptr<const void> &prepared_token = {}
   ) {
     if (!portal_capture_backend_allowed(generation.capture_backend)) {
       BOOST_LOG(error) << "portal: capture generation backend ["sv << generation.capture_backend
@@ -497,6 +539,9 @@ namespace portal {
     std::lock_guard transition_lock(g_capture_transition_mu);
     auto start = session_media::begin_start();
     reap_portal_cleanup();
+    if (session_media::pending_start_cancelled(session_media::pending_start_owner())) {
+      return nullptr;
+    }
     // Lock contract (SB-2 + S4 single mutex):
     // 1) Under g_media_mu: ensure session + start PipeWire (no dual-mutex nesting).
     // 2) Wait for negotiation OUTSIDE the lock so release_global_capture can progress.
@@ -509,17 +554,27 @@ namespace portal {
       if (g_media.capture && g_media.capture->running()) {
         const auto compatible = g_media.requested_width == width &&
                                 g_media.requested_height == height &&
+                                av_cmp_q(g_media.requested_rate, requested_rate) == 0 &&
                                 g_media.mem_type == mem_type &&
                                 g_media.generation == generation &&
                                 g_media.prefer_hdr == want_prefer_hdr &&
                                 g_media.prefer_sdr == want_prefer_sdr;
         if (compatible) {
+          if (capture_start_cancelled()) return nullptr;
+          // A normal capture call atomically adopts the preparation. A later
+          // expiry of its HTTP launch must not stop an active video thread.
+          g_media.prepared_token = prepared_token;
           return g_media.capture;
         }
 
         BOOST_LOG(info) << "portal: capture configuration changed; retiring PipeWire generation before reconnect"sv;
         auto retired_capture = std::move(g_media.capture);
-        auto retired_portal = std::move(g_media.portal);
+        // ANNOUNCE may refine size/HDR after HTTP launch. Retain the permission
+        // session for the same prepared source so that renegotiating PipeWire
+        // cannot reopen a picker after the client starts its video timer.
+        const bool retain_prepared_portal = g_media.prepared_token &&
+          g_media.generation == generation;
+        auto retired_portal = retain_prepared_portal ? nullptr : std::move(g_media.portal);
         auto retired_kwin = std::move(g_media.kwin);
         g_media.clear_meta();
         lock.unlock();
@@ -544,6 +599,8 @@ namespace portal {
         lock.lock();
       }
 
+      g_media.prepared_token = prepared_token;
+
       // W3/W5 gamescopegrab: prefer session-graph Video/Source (media.name=gamescope)
       // without private portal ScreenCast when linux_stream_mode=gamescope_stream.
       // Falls through to portal if the node is missing (idle unit not exporting yet).
@@ -552,13 +609,14 @@ namespace portal {
           generation.private_runtime == "gamescope") {
         if (auto gs = pipewire_capture::find_gamescope_video_source()) {
           if (auto local = start_local_pw_capture(
-                gs->node_id, gs->object_serial, width, height, mem_type, client_dynamic_range, generation)) {
+                gs->node_id, gs->object_serial, width, height, mem_type, client_dynamic_range, generation, requested_rate)) {
             BOOST_LOG(info) << "portal: gamescopegrab local Video/Source node="sv << gs->node_id
                             << " name="sv << gs->node_name << " (no private ScreenCast)"sv;
             g_media.kwin.reset();
             g_media.capture = std::move(local);
             g_media.requested_width = width;
             g_media.requested_height = height;
+        g_media.requested_rate = requested_rate;
             g_media.mem_type = mem_type;
             g_media.generation = generation;
             g_media.prefer_hdr = want_prefer_hdr;
@@ -598,7 +656,7 @@ namespace portal {
                 height > 0 ? height : src.height,
                 mem_type,
                 client_dynamic_range,
-                generation)) {
+                generation, requested_rate)) {
             BOOST_LOG(info) << "portal: kwingrab local PW node="sv << src.node_id
                             << " output="sv << src.output_name
                             << " (no xdg-desktop-portal picker)"sv;
@@ -607,6 +665,7 @@ namespace portal {
             g_media.capture = std::move(local);
             g_media.requested_width = width;
             g_media.requested_height = height;
+        g_media.requested_rate = requested_rate;
             g_media.mem_type = mem_type;
             g_media.generation = generation;
             g_media.prefer_hdr = want_prefer_hdr;
@@ -763,7 +822,10 @@ namespace portal {
           .may_use_dmabuf = may_use_dmabuf,
           .prefer_hdr_formats = want_prefer_hdr,
           .prefer_sdr_formats = want_prefer_sdr,
+          .requested_rate = requested_rate,
+          .request_fixed_rate = generation.private_runtime != "gamescope" && running_kwin_uses_fixed_rate(),
         });
+        if (session_media::teardown_in_progress() || session_media::pending_start_cancelled(session_media::pending_start_owner())) return nullptr;
         if (!new_capture->start()) {
           BOOST_LOG(warning) << "portal: Failed to start PipeWire capture; invalidating portal session"sv;
           new_capture.reset();
@@ -773,6 +835,7 @@ namespace portal {
 
         g_media.requested_width = width;
         g_media.requested_height = height;
+        g_media.requested_rate = requested_rate;
         g_media.mem_type = mem_type;
         g_media.generation = generation;
         g_media.prefer_hdr = want_prefer_hdr;
@@ -785,9 +848,7 @@ namespace portal {
     // The capture transport determines whether the encoder factory must use
     // RAM or GPU-resident input, so never select a factory before negotiation.
     // Wait outside g_media_mu so release_global_capture can take the lock.
-    for (int i = 0; i < 100 && capture && capture->running() && !capture->negotiated(); ++i) {
-      std::this_thread::sleep_for(100ms);
-    }
+    const bool negotiated = wait_for_capture_negotiation(capture);
 
     {
       std::lock_guard lock(g_media_mu);
@@ -795,7 +856,11 @@ namespace portal {
       if (g_media.capture != capture || g_media.generation != generation) {
         return nullptr;
       }
-      if (!capture || !capture->negotiated()) {
+      if (capture_start_cancelled()) {
+        if (capture) capture->stop();
+        return nullptr;
+      }
+      if (!negotiated) {
         BOOST_LOG(warning) << "portal: PipeWire format negotiation did not complete; invalidating portal session"sv;
         // Keep local `capture` so ~capture_t runs after unlock (no dtor under g_media_mu).
         g_media.reset_all();
@@ -804,6 +869,58 @@ namespace portal {
       return g_media.capture;
     }
   }
+
+  static void release_prepared_capture(const std::shared_ptr<const void> &token) {
+    std::lock_guard transition_lock(g_capture_transition_mu);
+    {
+      std::lock_guard media_lock(g_media_mu);
+      if (g_media.prepared_token != token) {
+        return;
+      }
+    }
+    // Reject stale leases before entering teardown: begin_teardown itself
+    // cancels portal requests. The transition lock fences replacement/adoption.
+    release_global_capture();
+  }
+
+  bool prepare_capture(platf::mem_type_e mem_type, const video::config_t &config,
+                       std::shared_ptr<void> &preparation) {
+    auto token = std::make_shared<const char>();
+    auto owner = std::shared_ptr<void>(new char, [token](void *value) {
+      delete static_cast<char *>(value);
+      session_media::schedule_retirement([token]() { release_prepared_capture(token); });
+    });
+    if (!ensure_global_capture(config.width, config.height, mem_type,
+                               config.dynamicRange, config.capture_generation,
+                               video::framerate_to_rational(config), token)) {
+      return false;
+    }
+    preparation = std::move(owner);
+    return true;
+  }
+
+#ifdef POLARIS_TESTS
+  std::shared_ptr<const void> install_prepared_cache_for_tests() {
+    std::lock_guard lock(g_media_mu);
+    g_media.portal = std::make_unique<portal_session_t>();
+    g_media.prepared_token = std::make_shared<const char>();
+    return g_media.prepared_token;
+  }
+
+  void adopt_prepared_cache_for_tests() {
+    std::lock_guard lock(g_media_mu);
+    g_media.prepared_token.reset();
+  }
+
+  void release_prepared_cache_for_tests(const std::shared_ptr<const void> &token) {
+    release_prepared_capture(token);
+  }
+
+  bool prepared_cache_present_for_tests() {
+    std::lock_guard lock(g_media_mu);
+    return !g_media.empty();
+  }
+#endif
 
   // -----------------------------------------------------------------------
   // Display backend
@@ -824,6 +941,7 @@ namespace portal {
     int cfg_height = 0;
     // Client stream dynamicRange (0 = SDR encode, 1 = 10-bit / HDR candidate).
     int client_dynamic_range = 0;
+    AVRational requested_rate {0, 1};
     platf::mem_type_e mem_type = platf::mem_type_e::system;
     bool pipewire_dmabuf_negotiated = false;
     // SPA_VIDEO_FORMAT_* from PipeWire negotiate; 0 = unknown / not yet negotiated.
@@ -851,6 +969,7 @@ namespace portal {
       cfg_width = requested_width;
       cfg_height = requested_height;
       client_dynamic_range = config.dynamicRange;
+      requested_rate = video::framerate_to_rational(config);
       mem_type = hwdevice_type;
 
       if (!probe_only) {
@@ -866,7 +985,7 @@ namespace portal {
         cage_configured = generation_.use_cage_compositor;
 #endif
         if (!cage_configured) {
-          auto cap = ensure_global_capture(requested_width, requested_height, mem_type, client_dynamic_range, generation_);
+          auto cap = ensure_global_capture(requested_width, requested_height, mem_type, client_dynamic_range, generation_, requested_rate);
           if (!cap) {
             return -1;
           }
@@ -986,7 +1105,7 @@ namespace portal {
 #endif
 
       // Fallback: source-owned portal/KWin capture (only when cage is NOT configured)
-      auto cap = ensure_global_capture(requested_width, requested_height, mem_type, client_dynamic_range, generation_);
+      auto cap = ensure_global_capture(requested_width, requested_height, mem_type, client_dynamic_range, generation_, requested_rate);
       if (!cap) {
         BOOST_LOG(warning) << "portal: No capture available"sv;
         return platf::capture_e::reinit;

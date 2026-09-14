@@ -76,6 +76,7 @@ set(TEST_SUPPORT_SOURCES
     ${CMAKE_SOURCE_DIR}/src/private_state_file.cpp
     ${CMAKE_SOURCE_DIR}/src/recovery_profile.cpp
     ${CMAKE_SOURCE_DIR}/src/stream_fec.cpp
+    ${CMAKE_SOURCE_DIR}/tests/fixtures/nanors_cpu_dispatch.c
     ${CMAKE_SOURCE_DIR}/src/web_session_store.cpp
     ${CMAKE_SOURCE_DIR}/src/beat_times.cpp
     ${CMAKE_SOURCE_DIR}/src/display_planner.cpp
@@ -84,7 +85,9 @@ set(TEST_SUPPORT_SOURCES
     ${CMAKE_SOURCE_DIR}/src/logging.cpp
     ${CMAKE_SOURCE_DIR}/src/update_status.cpp
     ${CMAKE_SOURCE_DIR}/src/verified_action.cpp
-    ${CMAKE_SOURCE_DIR}/src/rswrapper.c
+    ${CMAKE_SOURCE_DIR}/third-party/nanors/rs.c
+    ${CMAKE_SOURCE_DIR}/third-party/nanors/deps/obl/oblas_common.c
+    ${CMAKE_SOURCE_DIR}/third-party/nanors/deps/obl/oblas_lite.c
 )
 
 if(NOT WIN32 AND NOT APPLE AND NOT POLARIS_HAVE_LIBVA_MAP_BUFFER2)
@@ -107,6 +110,7 @@ set(TEST_AUDIT_SUPPORT_SOURCES
 )
 
 set(TEST_FAST_SOURCES
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_stream_packet_owner.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_bounded_log_file.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_benchmark_control_contract.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_builtin_artwork_contract.cpp
@@ -131,6 +135,8 @@ set(TEST_FAST_SOURCES
     ${CMAKE_SOURCE_DIR}/tests/unit/test_kmsgrab_logging_source.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_kms_capture_metadata.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_video_hdr_probe_guard_source.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_preallocated_gamepad_source.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_capture_backend_fallback_source.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_egl_ctx_release_guard_source.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_labwc_render_device_source.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_linux_platform_hardening_source.cpp
@@ -138,7 +144,7 @@ set(TEST_FAST_SOURCES
     ${CMAKE_SOURCE_DIR}/tests/unit/test_linux_stream_contract.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_prepared_ffmpeg.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_pulse_mainloop_contract.cpp
-    ${CMAKE_SOURCE_DIR}/tests/unit/test_rswrapper.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_reed_solomon.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_session_media_gate.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_source_safety_contracts.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_stream_fec.cpp
@@ -180,6 +186,7 @@ set(TEST_PLATFORM_SOURCES
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_desktop_takeover.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_display_topology.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_cuda_gl_encode_device.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_cuda_ram_encode_device.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_game_mode_host.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_gamescope_session_helper.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_graphics.cpp
@@ -198,6 +205,18 @@ if (NOT WIN32 AND NOT APPLE)
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_gamepad_isolation.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_input_group_access.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_wayland_virtual_input.cpp
+    )
+endif()
+
+if(LIBVA_FOUND)
+    list(APPEND TEST_PLATFORM_SOURCES
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_vaapi_tuning.cpp
+    )
+endif()
+
+if(LIBDRM_FOUND AND LIBCAP_FOUND)
+    list(APPEND TEST_PLATFORM_SOURCES
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_kms_named_binding.cpp
     )
 endif()
 
@@ -223,6 +242,7 @@ set(TEST_PAIRING_SOURCES
 )
 
 set(TEST_HTTP_SOURCES
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_live_tuning_http.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_httpcommon.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_launch_mode_contract.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_launch_response_status.cpp
@@ -241,8 +261,13 @@ set(TEST_AUDIO_SOURCES
 )
 
 set(TEST_STREAM_SOURCES
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_stream_packet_owner.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_stream_packet_session.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_live_tuning.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_adaptive_bitrate.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_ai_optimizer.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_ai_claude_cli.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_ai_provider_http.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_settings_metadata.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_stream.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_stream_display_policy.cpp
@@ -252,6 +277,7 @@ set(TEST_STREAM_SOURCES
 
 if (NOT WIN32 AND NOT APPLE)
     list(APPEND TEST_STREAM_SOURCES
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_stream_send_cancellation.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_multiseat_moonlight_activation.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_multiseat_moonlight_coordinator.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_multiseat_moonlight_runtime.cpp
@@ -264,6 +290,7 @@ if (NOT WIN32 AND NOT APPLE)
 endif()
 
 set(TEST_VIDEO_SOURCES
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_video_lifecycle_hardware.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_video.cpp
 )
 
@@ -397,8 +424,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         ${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_podman_backend.cpp
         ${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_authority.cpp
         ${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_client.cpp
+        ${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_media_pump.cpp
         ${CMAKE_SOURCE_DIR}/src/platform/linux/multiseat_worker_coordinator.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_multiseat_input_authority.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_virtual_gamepad_hid_identity.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_virtual_input_udev_contract.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_multiseat_input_protocol.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_multiseat_moonlight_input_adapter.cpp
@@ -409,6 +438,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_multiseat_podman_backend.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_multiseat_worker_authority.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_multiseat_worker_client.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_multiseat_worker_media_pump.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_multiseat_worker_coordinator.cpp
     )
 endif()
@@ -516,6 +546,11 @@ configure_polaris_test_target(${PROJECT_NAME}
     ${TEST_FAST_SOURCES}
 )
 
+add_test(
+    NAME polaris_prepared_ffmpeg_cmake
+    COMMAND ${CMAKE_COMMAND} -P ${CMAKE_SOURCE_DIR}/tests/cmake/test_prepared_ffmpeg.cmake
+)
+
 if (UNIX AND NOT APPLE)
     add_test(
         NAME polaris_invalid_locale_startup
@@ -577,6 +612,9 @@ if (BUILD_FULL_TESTS)
     configure_polaris_full_test_target(test_polaris_platform
         ${TEST_PLATFORM_SOURCES}
     )
+    if(CUDA_FOUND)
+        target_include_directories(test_polaris_platform SYSTEM PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    endif()
 
     configure_polaris_full_test_target(test_polaris_input
         ${TEST_INPUT_SOURCES}
@@ -605,14 +643,42 @@ if (BUILD_FULL_TESTS)
     configure_polaris_full_test_target(test_polaris_audio
         ${TEST_AUDIO_SOURCES}
     )
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_sources(test_polaris_audio PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_audio_process_id.cpp)
+    endif()
 
     configure_polaris_full_test_target(test_polaris_stream
         ${TEST_STREAM_SOURCES}
     )
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(test_polaris_stream PRIVATE
+            "-Wl,--wrap=sendmsg" "-Wl,--wrap=sendmmsg" "-Wl,--wrap=poll")
+        if(POLARIS_MULTISEAT_GO_INTEROP_SUPPORTED)
+            add_dependencies(test_polaris_stream polaris-multiseat-go-interop-fixture)
+            target_sources(test_polaris_stream PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/integration/test_multiseat_worker_interop.cpp)
+            target_compile_definitions(test_polaris_stream PRIVATE
+                POLARIS_WORKER_STREAM_INTEROP
+                POLARIS_MULTISEAT_GO_INTEROP_BINARY="${POLARIS_MULTISEAT_GO_INTEROP_BINARY}")
+        endif()
+    endif()
 
     configure_polaris_full_test_target(test_polaris_video
         ${TEST_VIDEO_SOURCES}
     )
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_library(encoder_probe_provider_fixture SHARED fixtures/encoder_probe_provider.cpp)
+        add_dependencies(test_polaris_video encoder_probe_provider_fixture)
+        target_compile_definitions(test_polaris_video PRIVATE
+            POLARIS_PROBE_PROVIDER_FIXTURE="$<TARGET_FILE:encoder_probe_provider_fixture>")
+        target_sources(test_polaris_video PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit/test_avcodec_session_lifecycle.cpp)
+        target_link_options(test_polaris_video PRIVATE
+            -Wl,--wrap=avcodec_send_frame
+            -Wl,--wrap=avcodec_receive_packet
+            -Wl,--wrap=avcodec_free_context)
+    endif()
 
     # Keep the historical target name as a build aggregate while the runtime coverage
     # lives in smaller executables that are easier to run and debug independently.
@@ -631,3 +697,8 @@ if (BUILD_FULL_TESTS)
             test_polaris_video
     )
 endif ()
+
+# Exercise actual inputtino code with private in-memory/socket transports.
+if(UNIX AND NOT APPLE)
+    add_subdirectory(fixtures/inputtino)
+endif()

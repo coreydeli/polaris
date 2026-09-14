@@ -28,10 +28,20 @@ type runningRealProvider struct {
 	stopError    error
 }
 
+// Required image acceptance fails on missing dependencies instead of silently
+// turning a provider startup test into a passing job with skipped tests.
+func unavailableRealDependency(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("POLARIS_TEST_REQUIRE_REAL_PROVIDERS") == "1" {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
 func requireTrustedBinary(t *testing.T, path string, expectedOwnerUID uint32) {
 	t.Helper()
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		t.Skipf("real provider dependency %s is unavailable", filepath.Base(path))
+		unavailableRealDependency(t, "real provider dependency %s is unavailable", filepath.Base(path))
 	} else if err != nil {
 		t.Fatal(err)
 	}
@@ -53,9 +63,15 @@ func realProviderOptions(t *testing.T, runtimePath string, audio bool) providerO
 			options.pipeWirePath,
 			options.pipeWirePulsePath,
 			options.pwCLIPath,
+			options.pwDumpPath,
+			options.wirePlumberPath,
 			options.pactlPath,
+			options.gstLaunchPath,
 		} {
 			requireTrustedBinary(t, path, options.executableOwnerUID)
+		}
+		if _, err := os.Stat("/usr/share/wireplumber/wireplumber.conf.d/99-polaris-seat.conf"); err != nil {
+			unavailableRealDependency(t, "real audio policy configuration is unavailable")
 		}
 	}
 	return options
@@ -183,6 +199,11 @@ func TestRealPrivateAudioGraphRoutesExactlyAndCleansUp(t *testing.T) {
 	options := realProviderOptions(t, runtimePath, true)
 	request := audioRequest("real-audio", "polaris-real-audio")
 	provider := startRealAudio(t, options, request)
+	tone := startRealAudioTone(t, options, request.AudioSink, 440, 660)
+	assertRealAudioSamples(t, options, request.AudioSink, 440, 660)
+	// Every receiver is a newly connected Pulse stream. Reconnecting must
+	// configure and link new ports after the previous receiver has retired.
+	assertRealAudioSamples(t, options, request.AudioSink, 440, 660)
 	if err := probeAudioGraph(
 		options,
 		audioEnvironment(runtimePath, request.AudioSink),
@@ -192,6 +213,7 @@ func TestRealPrivateAudioGraphRoutesExactlyAndCleansUp(t *testing.T) {
 		stopRealProvider(t, provider)
 		t.Fatal(err)
 	}
+	stopRealAudioTone(t, tone, options)
 	stopRealProvider(t, provider)
 	requireEmptyRuntime(t, runtimePath)
 }
@@ -239,6 +261,10 @@ func TestRealPrivateAudioGraphsRemainIndependent(t *testing.T) {
 	})
 	first := startRealAudio(t, firstOptions, firstRequest)
 	second := startRealAudio(t, secondOptions, secondRequest)
+	firstTone := startRealAudioTone(t, firstOptions, firstRequest.AudioSink, 440, 660)
+	secondTone := startRealAudioTone(t, secondOptions, secondRequest.AudioSink, 880, 1100)
+	assertRealAudioSamples(t, firstOptions, firstRequest.AudioSink, 440, 660)
+	assertRealAudioSamples(t, secondOptions, secondRequest.AudioSink, 880, 1100)
 	if err := probeAudioGraph(
 		firstOptions,
 		audioEnvironment(firstPath, firstRequest.AudioSink),
@@ -251,6 +277,7 @@ func TestRealPrivateAudioGraphsRemainIndependent(t *testing.T) {
 		stopRealProvider(t, secondBus)
 		t.Fatal("one private audio graph exposed the other seat sink")
 	}
+	stopRealAudioTone(t, firstTone, firstOptions)
 	stopRealProvider(t, first)
 	stopRealProvider(t, firstBus)
 	requireEmptyRuntime(t, firstPath)
@@ -269,9 +296,20 @@ func TestRealPrivateAudioGraphsRemainIndependent(t *testing.T) {
 		stopRealProvider(t, secondBus)
 		t.Fatalf("stopping one audio graph harmed the other: %v", err)
 	}
+	assertRealAudioSamples(t, secondOptions, secondRequest.AudioSink, 880, 1100)
+	stopRealAudioTone(t, secondTone, secondOptions)
 	stopRealProvider(t, second)
 	stopRealProvider(t, secondBus)
 	requireEmptyRuntime(t, secondPath)
+}
+
+// Only opt-in real tests consume the explicitly catalogued hardware node.
+func realDisplayRequest(namespace, socket string) seatruntime.Request {
+	request := displayRequest(namespace, socket)
+	if node := os.Getenv("POLARIS_TEST_PROVIDER_RENDER_NODE"); node != "" {
+		request.RenderNode = node
+	}
+	return request
 }
 
 func realDisplayProviderOptions(t *testing.T, runtimePath string) providerOptions {
@@ -279,7 +317,10 @@ func realDisplayProviderOptions(t *testing.T, runtimePath string) providerOption
 	options := defaultProviderOptions()
 	options.runtimeDirectory = runtimePath
 	options.runtimeOwnerUID = uint32(os.Geteuid())
-	options.softwareDisplay = true
+	options.softwareDisplay = os.Getenv("POLARIS_TEST_PROVIDER_RENDER_NODE") == ""
+	if !options.softwareDisplay && os.Getenv("POLARIS_TEST_GAMESCOPE_ALLOW_DRM") != "1" {
+		t.Fatal("hardware provider validation needs explicit DRM-device authorization")
+	}
 	if pluginPath := os.Getenv("POLARIS_TEST_GST_PLUGIN_PATH"); pluginPath != "" {
 		if !validAbsolutePath(pluginPath) {
 			t.Fatalf("real display plugin path is invalid: %s", pluginPath)
@@ -302,7 +343,7 @@ func realDisplayProviderOptions(t *testing.T, runtimePath string) providerOption
 			environment,
 			3*time.Second,
 		); err != nil {
-			t.Skipf("real display dependency %s is unavailable", element)
+			unavailableRealDependency(t, "real display dependency %s is unavailable: %v", element, err)
 		}
 	}
 	return options
@@ -311,7 +352,7 @@ func realDisplayProviderOptions(t *testing.T, runtimePath string) providerOption
 func TestRealDisplayCaptureProducesFrameAndCleansUp(t *testing.T) {
 	runtimePath := privateDisplayRuntimeDirectoryForTest(t)
 	options := realDisplayProviderOptions(t, runtimePath)
-	request := displayRequest("real-display", "polaris-capture-real")
+	request := realDisplayRequest("real-display", "polaris-capture-real")
 	request.DisplayRefreshMillihertz = 59940
 	provider := startRealProvider(t, func(context context.Context, ready io.WriteCloser) error {
 		return runDisplayCapture(context, request, ready, options)
@@ -333,8 +374,8 @@ func TestRealDisplayCapturesRemainIndependent(t *testing.T) {
 	firstOptions := realDisplayProviderOptions(t, firstPath)
 	secondOptions := firstOptions
 	secondOptions.runtimeDirectory = secondPath
-	firstRequest := displayRequest("real-display-first", "polaris-capture-real-first")
-	secondRequest := displayRequest("real-display-second", "polaris-capture-real-second")
+	firstRequest := realDisplayRequest("real-display-first", "polaris-capture-real-first")
+	secondRequest := realDisplayRequest("real-display-second", "polaris-capture-real-second")
 	secondRequest.DisplayRefreshMillihertz = 97000
 	first := startRealProvider(t, func(context context.Context, ready io.WriteCloser) error {
 		return runDisplayCapture(context, firstRequest, ready, firstOptions)
@@ -355,7 +396,7 @@ func TestRealDisplayCapturesRemainIndependent(t *testing.T) {
 		displayProbeArguments(
 			secondRequest,
 			filepath.Join(secondPath, secondMediaName),
-			true,
+			secondOptions.softwareDisplay,
 		),
 		displayEnvironment(secondOptions),
 		3*time.Second,
@@ -370,24 +411,30 @@ func TestRealDisplayCapturesRemainIndependent(t *testing.T) {
 func realNestedCompositorOptions(t *testing.T, runtimePath string) providerOptions {
 	t.Helper()
 	if os.Getenv("POLARIS_TEST_GAMESCOPE_ALLOW_DRM") != "1" {
-		t.Skip("real Gamescope/Xwayland test needs explicit DRM-device authorization")
-	}
-	icdPath := os.Getenv("POLARIS_TEST_GAMESCOPE_SOFTWARE_ICD")
-	if icdPath == "" {
-		t.Skip("POLARIS_TEST_GAMESCOPE_SOFTWARE_ICD is not set")
-	}
-	if !validAbsolutePath(icdPath) {
-		t.Fatalf("real Gamescope software ICD path is invalid: %s", icdPath)
-	}
-	status, err := os.Lstat(icdPath)
-	if err != nil || !status.Mode().IsRegular() || status.Mode().Perm()&0o022 != 0 {
-		t.Fatalf("real Gamescope software ICD is unavailable or writable: %v", err)
+		unavailableRealDependency(t, "real Gamescope/Xwayland test needs explicit DRM-device authorization")
 	}
 	options := defaultProviderOptions()
 	options.runtimeDirectory = runtimePath
 	options.runtimeOwnerUID = uint32(os.Geteuid())
-	options.softwareGamescope = true
-	options.softwareVulkanICDPath = icdPath
+	if node := os.Getenv("POLARIS_TEST_PROVIDER_RENDER_NODE"); node != "" {
+		if err := validateDisplayRenderNode(node); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		icdPath := os.Getenv("POLARIS_TEST_GAMESCOPE_SOFTWARE_ICD")
+		if icdPath == "" {
+			unavailableRealDependency(t, "POLARIS_TEST_GAMESCOPE_SOFTWARE_ICD is not set")
+		}
+		if !validAbsolutePath(icdPath) {
+			t.Fatalf("real Gamescope software ICD path is invalid: %s", icdPath)
+		}
+		status, err := os.Lstat(icdPath)
+		if err != nil || !status.Mode().IsRegular() || status.Mode().Perm()&0o022 != 0 {
+			t.Fatalf("real Gamescope software ICD is unavailable or writable: %v", err)
+		}
+		options.softwareGamescope = true
+		options.softwareVulkanICDPath = icdPath
+	}
 	options.allowSharedX11 = true
 	options.startupTimeout = defaultGamescopeStartupTimeout
 	options.probeTimeout = 3 * time.Second
@@ -428,16 +475,11 @@ func readRealGamescopeSession(
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(string(content), "\n")
-	if len(lines) != 6 || lines[0] != strings.TrimSuffix(gamescopeSessionRecordHeader, "\n") ||
-		!strings.HasPrefix(lines[1], "DISPLAY=:") ||
-		lines[2] != "STEAM_GAME_DISPLAY_0="+strings.TrimPrefix(lines[1], "DISPLAY=") ||
-		lines[3] != "WAYLAND_DISPLAY="+request.WaylandSocket ||
-		lines[4] != "GAMESCOPE_WAYLAND_DISPLAY="+request.WaylandSocket ||
-		lines[5] != "" {
+	session, err := parseLauncherSession(content, request.WaylandSocket)
+	if err != nil || session.width != request.DisplayWidth || session.height != request.DisplayHeight || session.refresh != request.DisplayRefreshMillihertz {
 		t.Fatalf("real Gamescope session record is malformed: %q", content)
 	}
-	display := strings.TrimPrefix(lines[1], "DISPLAY=")
+	display := session.display
 	info, err := parseGamescopeReadyRecord(display+" "+gamescopeWaylandSocket+"\n", true)
 	if err != nil {
 		t.Fatalf("real Gamescope display record is invalid: %q, %v", display, err)
@@ -558,7 +600,7 @@ func TestRealHeadlessGamescopePublishesBothProtocolsAndCleansUp(t *testing.T) {
 	displayOptions := realDisplayProviderOptions(t, runtimePath)
 	nestedOptions := realNestedCompositorOptions(t, runtimePath)
 	x11Baseline := realX11Baseline(t)
-	display := displayRequest("real-nested", "polaris-capture-real-nested")
+	display := realDisplayRequest("real-nested", "polaris-capture-real-nested")
 	display.DisplayWidth = 1280
 	display.DisplayHeight = 720
 	outer := startRealProvider(t, func(providerContext context.Context, ready io.WriteCloser) error {
@@ -601,10 +643,10 @@ func TestTwoRealHeadlessGamescopeStacksRemainIndependent(t *testing.T) {
 	firstNestedOptions := realNestedCompositorOptions(t, firstRuntime)
 	secondNestedOptions := realNestedCompositorOptions(t, secondRuntime)
 	x11Baseline := realX11Baseline(t)
-	firstDisplay := displayRequest("real-nested-first", "polaris-capture-real-nested-first")
+	firstDisplay := realDisplayRequest("real-nested-first", "polaris-capture-real-nested-first")
 	firstDisplay.DisplayWidth = 1280
 	firstDisplay.DisplayHeight = 720
-	secondDisplay := displayRequest("real-nested-second", "polaris-capture-real-nested-second")
+	secondDisplay := realDisplayRequest("real-nested-second", "polaris-capture-real-nested-second")
 	secondDisplay.DisplayWidth = 960
 	secondDisplay.DisplayHeight = 540
 	secondDisplay.DisplayRefreshMillihertz = 97000
