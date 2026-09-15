@@ -88,7 +88,7 @@ Setting modes from the config file instead of the web UI? The key and value name
 
 Pick **Private Stream (GPU-native)**. NVIDIA with NVENC is the most heavily tested Polaris path, and it supports the fast capture route where frames never leave the GPU.
 
-Use the official packages when you can. If you build from source, build with CUDA enabled; without it, capture takes a slower copy through system memory, and the log says so ([Troubleshooting](troubleshooting.md#nvidia-kms-capture-issues) shows the exact line).
+Use the official packages when you can: the Fedora, Arch and Ubuntu packages are built with CUDA. If you build from source, build with CUDA enabled; without it, every capture path copies each frame through system memory before NVENC, whatever mode you pick, and both the log and the host Doctor say so before you stream ([Troubleshooting](troubleshooting.md#capture-is-on-the-cpu) lists every cause).
 
 > [!WARNING]
 > Plain **Private Stream** with GPU-native capture off can refuse the very first launch on a fresh NVIDIA setup with a 503 error, even though the GPU is healthy. If that happens, switch to Private Stream (GPU-native), restart Polaris, and retry. [Troubleshooting](troubleshooting.md#headless-session-does-not-start-cleanly) explains why.
@@ -107,6 +107,15 @@ Two practical settings:
 ### Intel
 
 Same advice as AMD: Private Stream, Mesa VA-API, expect SHM capture. On an Arc discrete card, set `adapter_name` so Polaris picks the Arc GPU rather than the integrated one.
+
+### Hybrid laptops (an Intel or AMD iGPU next to an NVIDIA card)
+
+On a laptop the desktop usually renders on the integrated GPU while Polaris, left on auto, picks the NVIDIA card for encoding because it is the discrete one. That split works, but know what it costs: Mirror Desktop captures into system memory (frames from the iGPU cannot be handed to the NVIDIA card as DMA-BUF), and the NVIDIA card is woken from its power-saving state for every stream. The Doctor names the split as `linux_gpu_adapter_mismatch` with both ways out:
+
+- Keep everything on the iGPU: `adapter_name = /dev/dri/renderD128` (or whichever node the Doctor names as the compositor's) and `encoder = vaapi`. Slower encoder, no cross-GPU traffic, the NVIDIA card stays asleep.
+- Keep NVENC: leave the split and turn off NVIDIA runtime power management (`options nvidia NVreg_DynamicPowerManagement=0x00` in `/etc/modprobe.d/nvidia-pm.conf`, rebuild the initramfs, reboot). Costs battery, removes the sleep/wake cycle that has frozen laptops.
+
+If the whole machine freezes during a stream, [Troubleshooting](troubleshooting.md#whole-machine-freeze-on-a-hybrid-laptop) has the order to test things in.
 
 ## Linux setup checklist
 
@@ -138,7 +147,7 @@ Set the host encoder (`nvenc` on NVIDIA, `vaapi` on AMD and Intel Mesa hosts), t
 
 ### GPU-native capture preference
 
-Leave the GPU-native preference off unless session health shows SHM or system-memory fallback on a host that should support GPU-resident capture; the flag does not apply to Gamescope Stream. When the preference is on, Polaris may run labwc windowed instead of fully hidden so DMA-BUF capture can stay GPU-resident. NVIDIA hosts running true headless (NVENC, headless labwc) with the preference off can refuse the first launch with a cold-cache 503; switch to Private Stream (GPU-native) or enable the preference, restart Polaris, and retry, as covered in [the NVIDIA warning above](#if-you-have-an-nvidia-card).
+Leave the GPU-native preference off unless the host Doctor's capture forecast or session health shows SHM or system-memory fallback on a host that should support GPU-resident capture; the flag does not apply to Gamescope Stream. When the preference is on, Polaris may run labwc windowed instead of fully hidden so DMA-BUF capture can stay GPU-resident. NVIDIA hosts running true headless (NVENC, headless labwc) with the preference off can refuse the first launch with a cold-cache 503; switch to Private Stream (GPU-native) or enable the preference, restart Polaris, and retry, as covered in [the NVIDIA warning above](#if-you-have-an-nvidia-card).
 
 ## How capture works
 

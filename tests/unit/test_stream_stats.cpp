@@ -5,6 +5,7 @@
 
 #include <src/stream_stats.h>
 #include <src/config.h>
+#include <src/platform/common.h>
 #include <src/doctor_actions.h>
 #include <src/adaptive_bitrate.h>
 #include <src/private_state_file.h>
@@ -23,6 +24,8 @@
 #include <string>
 #include <thread>
 #ifdef __linux__
+  #include <src/platform/linux/misc.h>
+  #include <src/platform/linux/user_unit_override.h>
   #include <unistd.h>
 #endif
 
@@ -44,6 +47,11 @@ namespace {
       config::video.linux_display.headless_mode = headless_mode;
       config::video.linux_display.use_cage_compositor = use_cage_compositor;
       config::video.linux_display.prefer_gpu_native_capture = prefer_gpu_native_capture;
+#ifdef __linux__
+      platf::set_selected_capture_backend_for_tests(std::nullopt);
+      platf::set_effective_encoder_render_device_for_tests(std::string {});
+#endif
+      stream_stats::set_build_has_cuda_for_tests(std::nullopt);
     }
 
     std::string adapter_name;
@@ -226,6 +234,7 @@ TEST(StreamStatsLinuxGpuProfileTests, WarnsWhenNvidiaTrueHeadlessDisablesGpuNati
   config::video.linux_display.headless_mode = true;
   config::video.linux_display.use_cage_compositor = true;
   config::video.linux_display.prefer_gpu_native_capture = false;
+  stream_stats::set_build_has_cuda_for_tests(true);
 
   stream_stats::stats_t stats {};
   stats.runtime_backend = "labwc";
@@ -955,6 +964,124 @@ TEST(StreamStatsDoctorTests, SaysNothingWhenTheConfiguredCaptureBackendWasUsed) 
        doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
     EXPECT_NE(warning.at("id"), "capture_backend_substituted");
   }
+}
+
+TEST(StreamStatsDoctorTests, NamesTheCapabilityWhenKmsWasRefusedAndNothingElseCaptures) {
+  // capture = kms on a binary without CAP_SYS_ADMIN: kmsgrab finds the display, cannot read a
+  // framebuffer, and the host serves with no capture at all. The journal says which command to
+  // run, once, at boot. The Doctor has to say it where the person is standing.
+  LinuxDisplayConfigGuard guard;
+  config::video.capture = "kms";
+  platf::set_capture_sources_missing_for_tests(true);
+  platf::set_kms_capture_refused_for_tests(true);
+
+  stream_stats::stats_t stats {};
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  bool saw_warning = false;
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    if (warning.at("id") != "kms_capture_needs_capability") {
+      continue;
+    }
+    saw_warning = true;
+    EXPECT_EQ(warning.at("severity"), "fail");
+    EXPECT_NE(warning.at("message").get<std::string>().find("CAP_SYS_ADMIN"), std::string::npos);
+    EXPECT_NE(warning.at("action").get<std::string>().find("--setup-host --enable-kms"), std::string::npos);
+  }
+  EXPECT_TRUE(saw_warning);
+
+  platf::set_kms_capture_refused_for_tests(false);
+  platf::set_capture_sources_missing_for_tests(false);
+}
+
+TEST(StreamStatsDoctorTests, ASubstitutedKmsNamesTheCapabilityNotTheCompositor) {
+  // The substitution text was written for wlr on KDE. Read for kms it blames compositor
+  // protocols and tells the user to stop using the one backend that carries HDR.
+  LinuxDisplayConfigGuard guard;
+  config::video.capture = "kms";
+  platf::set_capture_backend_substitution_for_tests("kms -> portal");
+  platf::set_kms_capture_refused_for_tests(true);
+
+  stream_stats::stats_t stats {};
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  bool saw_substituted = false;
+  bool saw_capability = false;
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    const auto id = warning.at("id").get<std::string>();
+    if (id == "capture_backend_substituted") {
+      saw_substituted = true;
+      EXPECT_NE(warning.at("message").get<std::string>().find("CAP_SYS_ADMIN"), std::string::npos);
+      EXPECT_EQ(warning.at("message").get<std::string>().find("wlroots capture protocols"), std::string::npos);
+      EXPECT_NE(warning.at("action").get<std::string>().find("--enable-kms"), std::string::npos);
+    }
+    if (id == "kms_capture_needs_capability") {
+      saw_capability = true;
+      EXPECT_EQ(warning.at("severity"), "warning");
+    }
+  }
+  EXPECT_TRUE(saw_substituted);
+  EXPECT_TRUE(saw_capability);
+
+  platf::set_kms_capture_refused_for_tests(false);
+  platf::set_capture_backend_substitution_for_tests("");
+}
+
+TEST(StreamStatsDoctorTests, SaysNothingAboutTheKmsCapabilityUnlessKmsWasRefused) {
+  LinuxDisplayConfigGuard guard;
+  config::video.capture = "wlr";
+  platf::set_capture_backend_substitution_for_tests("wlr -> portal");
+  platf::set_kms_capture_refused_for_tests(false);
+
+  stream_stats::stats_t stats {};
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    EXPECT_NE(warning.at("id"), "kms_capture_needs_capability");
+    if (warning.at("id") == "capture_backend_substituted") {
+      EXPECT_EQ(warning.at("message").get<std::string>().find("CAP_SYS_ADMIN"), std::string::npos);
+    }
+  }
+
+  platf::set_capture_backend_substitution_for_tests("");
+}
+
+TEST(StreamStatsDoctorTests, HdrFindingNamesTheRecipeAndTheCapabilityWhenKmsWasRefused) {
+  // Explaining why HDR did not engage is only half of it; the person wants to know what to
+  // change. Now that the recipe is proven (kms capture on a mode that shows the real HDR
+  // output), the finding can name it, and name the capability when that is what stopped it.
+  LinuxDisplayConfigGuard guard;
+  config::video.capture = "wlr";
+  config::video.linux_display.use_cage_compositor = true;
+  platf::set_kms_capture_refused_for_tests(true);
+
+  stream_stats::stats_t stats {};
+  stats.dynamic_range = 1;
+  stats.runtime_effective_headless = true;
+  stats.display_hdr = false;
+  stats.hdr_metadata_available = false;
+  stats.stream_hdr_enabled = false;
+
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  bool saw_hdr = false;
+  for (const auto &warning :
+       doctor.at("advanced_evidence").at("linux_gpu_profile").at("configuration_warnings")) {
+    if (warning.at("id") != "hdr_capture_path_cannot_report_hdr") {
+      continue;
+    }
+    saw_hdr = true;
+    const auto action = warning.at("action").get<std::string>();
+    EXPECT_NE(action.find("capture = kms"), std::string::npos);
+    EXPECT_NE(action.find("Mirror Desktop"), std::string::npos);
+    EXPECT_NE(action.find("--enable-kms"), std::string::npos);
+  }
+  EXPECT_TRUE(saw_hdr);
+
+  platf::set_kms_capture_refused_for_tests(false);
 }
 
 TEST(StreamStatsDoctorTests, NamesTheCapturePathWhenHdrWasAskedForAndNotDelivered) {
@@ -3417,6 +3544,7 @@ TEST(StreamStatsDoctorTests, KeepsNvidiaHeadlessWarningsInAdvancedEvidence) {
   config::video.linux_display.headless_mode = true;
   config::video.linux_display.use_cage_compositor = true;
   config::video.linux_display.prefer_gpu_native_capture = false;
+  stream_stats::set_build_has_cuda_for_tests(true);
 
   stream_stats::stats_t stats {};
   stats.streaming = true;
@@ -5598,3 +5726,337 @@ TEST(BenchmarkRunHotPathTests, RecordDuringDrainAcceptsInWindowStartsAndExcludes
   });
   EXPECT_EQ(result, stream_stats::benchmark_run_get_result_e::found);
 }
+
+#ifdef __linux__
+TEST(StreamStatsDoctorTests, ForecastStaysSilentUntilCaptureSourcesWereEvaluated) {
+  // Nothing has been looked at: no backend, no forecast, no finding. The Doctor must never
+  // report a problem it has not looked for.
+  LinuxDisplayConfigGuard guard;
+  config::video.encoder = "nvenc";
+  stream_stats::set_build_has_cuda_for_tests(false);
+
+  stream_stats::stats_t stats {};
+  const auto profile = stream_stats::linux_gpu_profile_json(stats);
+
+  EXPECT_EQ(profile.at("capture_forecast").at("backend"), "unevaluated");
+  EXPECT_EQ(profile.at("capture_forecast").at("residency"), "unknown");
+  EXPECT_EQ(profile.at("capture_forecast").at("build_has_cuda"), false);
+  for (const auto &warning : profile.at("configuration_warnings")) {
+    EXPECT_NE(warning.at("id"), "capture_copies_through_system_memory");
+  }
+}
+
+TEST(StreamStatsDoctorTests, NamesTheBuildWhenNvidiaCaptureCannotStayOnTheGpuWithoutCuda) {
+  // An NVIDIA host on a CUDA-less package copies every frame through system memory whatever
+  // the mode. The GPU-native advice is a dead end there, so it has to give way to the build.
+  LinuxDisplayConfigGuard guard;
+  config::video.encoder = "nvenc";
+  config::video.linux_display.headless_mode = true;
+  config::video.linux_display.use_cage_compositor = true;
+  config::video.linux_display.prefer_gpu_native_capture = false;
+  platf::set_selected_capture_backend_for_tests("wlr");
+  stream_stats::set_build_has_cuda_for_tests(false);
+
+  stream_stats::stats_t stats {};
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+  const auto &profile = doctor.at("advanced_evidence").at("linux_gpu_profile");
+
+  bool saw_forecast = false;
+  for (const auto &warning : profile.at("configuration_warnings")) {
+    const auto id = warning.at("id").get<std::string>();
+    EXPECT_NE(id, "nvidia_headless_gpu_native_disabled");
+    if (id != "capture_copies_through_system_memory") {
+      continue;
+    }
+    saw_forecast = true;
+    EXPECT_EQ(warning.at("cause"), "build_without_cuda");
+    EXPECT_EQ(warning.at("severity"), "warning");
+    EXPECT_NE(warning.at("message").get<std::string>().find("cuda=disabled"), std::string::npos);
+    EXPECT_NE(warning.at("action").get<std::string>().find("-DPOLARIS_ENABLE_CUDA=ON"), std::string::npos);
+  }
+  EXPECT_TRUE(saw_forecast);
+  EXPECT_EQ(profile.at("capture_forecast").at("residency"), "system_memory");
+  EXPECT_EQ(profile.at("capture_forecast").at("cause"), "build_without_cuda");
+  EXPECT_EQ(profile.at("capture_forecast").at("build_has_cuda"), false);
+  EXPECT_EQ(profile.at("capture_forecast").at("backend"), "wlr");
+}
+
+TEST(StreamStatsDoctorTests, KeepsTheGpuNativeAdviceWhenTheBuildHasCuda) {
+  LinuxDisplayConfigGuard guard;
+  config::video.encoder = "nvenc";
+  config::video.linux_display.headless_mode = true;
+  config::video.linux_display.use_cage_compositor = true;
+  config::video.linux_display.prefer_gpu_native_capture = false;
+  platf::set_selected_capture_backend_for_tests("wlr");
+  stream_stats::set_build_has_cuda_for_tests(true);
+
+  stream_stats::stats_t stats {};
+  const auto profile = stream_stats::linux_gpu_profile_json(stats);
+
+  bool saw_gpu_native_advice = false;
+  for (const auto &warning : profile.at("configuration_warnings")) {
+    const auto id = warning.at("id").get<std::string>();
+    saw_gpu_native_advice = saw_gpu_native_advice || id == "nvidia_headless_gpu_native_disabled";
+    // No probe has run on this host yet, so the forecast has nothing to warn about.
+    EXPECT_NE(id, "capture_copies_through_system_memory");
+  }
+  EXPECT_TRUE(saw_gpu_native_advice);
+  EXPECT_EQ(profile.at("capture_forecast").at("residency"), "unknown");
+  EXPECT_EQ(profile.at("capture_forecast").at("build_has_cuda"), true);
+}
+
+TEST(StreamStatsDoctorTests, SaysX11CaptureCopiesThroughSystemMemory) {
+  LinuxDisplayConfigGuard guard;
+  config::video.encoder = "nvenc";
+  config::video.linux_display.use_cage_compositor = false;
+  platf::set_selected_capture_backend_for_tests("x11");
+  stream_stats::set_build_has_cuda_for_tests(true);
+
+  stream_stats::stats_t stats {};
+  const auto profile = stream_stats::linux_gpu_profile_json(stats);
+
+  bool saw_forecast = false;
+  for (const auto &warning : profile.at("configuration_warnings")) {
+    if (warning.at("id") != "capture_copies_through_system_memory") {
+      continue;
+    }
+    saw_forecast = true;
+    EXPECT_EQ(warning.at("cause"), "x11_capture");
+    EXPECT_NE(warning.at("message").get<std::string>().find("x11grab"), std::string::npos);
+    EXPECT_NE(warning.at("action").get<std::string>().find("Wayland"), std::string::npos);
+  }
+  EXPECT_TRUE(saw_forecast);
+}
+#endif
+
+TEST(CaptureForecastTests, VaapiStaysInSystemMemoryByDesignOnEveryPath) {
+  stream_stats::capture_forecast_inputs_t inputs;
+  inputs.encoder = "vaapi";
+  inputs.build_has_cuda = false;
+
+  inputs.capture_backend = "wlr";
+  inputs.use_cage_compositor = true;
+  auto forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.residency, "system_memory");
+  EXPECT_EQ(forecast.cause, "vaapi_system_memory_by_design");
+  EXPECT_EQ(forecast.severity, "info");
+  EXPECT_NE(forecast.message.find("Private Stream"), std::string::npos);
+  EXPECT_EQ(forecast.action.find("POLARIS_PORTAL_DMABUF"), std::string::npos);
+
+  inputs.capture_backend = "portal";
+  inputs.use_cage_compositor = false;
+  forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.cause, "vaapi_system_memory_by_design");
+  EXPECT_NE(forecast.message.find("desktop portal"), std::string::npos);
+  EXPECT_NE(forecast.action.find("POLARIS_PORTAL_DMABUF=1"), std::string::npos);
+
+  // The operator opted into the unvalidated DMA-BUF path; the forecast no longer knows.
+  inputs.portal_vaapi_dmabuf_opted_in = true;
+  forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.residency, "unknown");
+  EXPECT_TRUE(forecast.cause.empty());
+
+  // KMS imports the framebuffer into VA-API directly.
+  inputs.capture_backend = "kms";
+  forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.residency, "gpu");
+  EXPECT_TRUE(forecast.cause.empty());
+}
+
+TEST(CaptureForecastTests, NvidiaPrivateStreamFollowsTheLastDmabufProbe) {
+  stream_stats::capture_forecast_inputs_t inputs;
+  inputs.capture_backend = "wlr";
+  inputs.encoder = "nvenc";
+  inputs.build_has_cuda = true;
+  inputs.use_cage_compositor = true;
+  inputs.headless_mode = true;
+  inputs.prefer_gpu_native_capture = false;
+
+  // Hidden headless, no probe yet: the first launch decides.
+  auto forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.residency, "unknown");
+  EXPECT_TRUE(forecast.cause.empty());
+
+  inputs.headless_extcopy_dmabuf_probe = true;
+  forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.residency, "gpu");
+
+  inputs.headless_extcopy_dmabuf_probe = false;
+  forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.residency, "system_memory");
+  EXPECT_EQ(forecast.cause, "headless_dmabuf_unavailable");
+  EXPECT_EQ(forecast.severity, "warning");
+  EXPECT_NE(forecast.action.find("Private Stream (GPU-native)"), std::string::npos);
+  EXPECT_NE(forecast.action.find("linux_prefer_gpu_native_capture = enabled"), std::string::npos);
+
+  // With the preference on, the private compositor runs windowed and the other probe rules.
+  inputs.prefer_gpu_native_capture = true;
+  forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.residency, "unknown");
+  inputs.windowed_gpu_native_probe = false;
+  forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.cause, "windowed_dmabuf_unavailable");
+  inputs.windowed_gpu_native_probe = true;
+  forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.residency, "gpu");
+  EXPECT_TRUE(forecast.cause.empty());
+
+  // A wlroots desktop captured directly is the compositor's call; nothing to forecast.
+  inputs.use_cage_compositor = false;
+  forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.residency, "unknown");
+}
+
+TEST(CaptureForecastTests, TheBuildOutranksEveryOtherNvidiaCause) {
+  stream_stats::capture_forecast_inputs_t inputs;
+  inputs.encoder = "nvenc";
+  inputs.build_has_cuda = false;
+  inputs.use_cage_compositor = true;
+  inputs.headless_mode = true;
+  inputs.headless_extcopy_dmabuf_probe = true;  // a GPU-native probe that once passed changes nothing
+
+  for (const auto *backend : {"wlr", "kms", "portal"}) {
+    inputs.capture_backend = backend;
+    const auto forecast = stream_stats::forecast_capture_path(inputs);
+    EXPECT_EQ(forecast.cause, "build_without_cuda") << backend;
+    EXPECT_EQ(forecast.residency, "system_memory") << backend;
+  }
+
+  // X11 is system memory with or without CUDA, so it keeps its own cause.
+  inputs.capture_backend = "x11";
+  EXPECT_EQ(stream_stats::forecast_capture_path(inputs).cause, "x11_capture");
+
+  // NvFBC is only compiled with CUDA and stays on the GPU.
+  inputs.build_has_cuda = true;
+  inputs.capture_backend = "nvfbc";
+  EXPECT_EQ(stream_stats::forecast_capture_path(inputs).residency, "gpu");
+}
+
+TEST(CaptureForecastTests, HasNothingToSayWithoutABackendOrWithASoftwareEncoder) {
+  stream_stats::capture_forecast_inputs_t inputs;
+  inputs.encoder = "nvenc";
+  inputs.build_has_cuda = false;
+
+  for (const auto *backend : {"", "none"}) {
+    inputs.capture_backend = backend;
+    const auto forecast = stream_stats::forecast_capture_path(inputs);
+    EXPECT_EQ(forecast.residency, "unknown") << "'" << backend << "'";
+    EXPECT_TRUE(forecast.cause.empty()) << "'" << backend << "'";
+  }
+
+  inputs.capture_backend = "wlr";
+  inputs.encoder = "software";
+  const auto forecast = stream_stats::forecast_capture_path(inputs);
+  EXPECT_EQ(forecast.residency, "system_memory");
+  EXPECT_TRUE(forecast.cause.empty());
+
+  const auto json = stream_stats::capture_forecast_json(inputs, forecast);
+  EXPECT_EQ(json.at("backend"), "wlr");
+  EXPECT_EQ(json.at("encoder"), "software");
+  EXPECT_EQ(json.at("build_has_cuda"), false);
+  EXPECT_EQ(json.at("residency"), "system_memory");
+  EXPECT_EQ(json.at("cause"), "");
+}
+
+#ifdef __linux__
+TEST(StreamStatsDoctorTests, NamesTheBinaryThatProducedTheReport) {
+  // A support thread needs the running binary on its first line: the Bazzite
+  // KMS recipe runs a copy outside the package that updates never touch.
+  stream_stats::stats_t stats {};
+  const auto doctor = stream_stats::build_doctor_json(stats, {{"primary_issue", "steady"}, {"grade", "good"}});
+
+  const auto running = platf::user_unit::running_executable();
+  ASSERT_TRUE(running.has_value());
+  const auto binary = platf::user_unit::describe_running_binary(*running, POLARIS_EXECUTABLE_PATH);
+  const bool outside_package = binary.matches_package == std::optional<bool> {false};
+
+  bool saw_row = false;
+  for (const auto &entry : doctor.at("evidence")) {
+    if (entry.at("id") != "running_binary") {
+      continue;
+    }
+    saw_row = true;
+    EXPECT_EQ(entry.at("value"), binary.path);
+    EXPECT_EQ(entry.at("status"), outside_package ? "watch" : "pass");
+    const auto detail = entry.at("detail").get<std::string>();
+    EXPECT_NE(detail.find(binary.path), std::string::npos);
+    EXPECT_NE(detail.find(PROJECT_VERSION), std::string::npos);
+    EXPECT_EQ(detail.find("outside") != std::string::npos || detail.find("not the packaged") != std::string::npos, outside_package);
+  }
+  EXPECT_TRUE(saw_row);
+}
+#endif
+
+#ifdef __linux__
+TEST(StreamStatsLinuxGpuProfileTests, NamesTheHybridSplitWhenPolarisChoseTheEncoderNodeItself) {
+  // adapter_name unset, the desktop renders on one node and Polaris auto-picked another:
+  // the reporter's laptop. Before this the Doctor called the pairing "unknown".
+  LinuxDisplayConfigGuard guard;
+  TempFileGuard igpu_node("hybrid-igpu");
+  TempFileGuard dgpu_node("hybrid-dgpu");
+  config::video.adapter_name.clear();
+  platf::set_effective_encoder_render_device_for_tests(dgpu_node.string());
+
+  stream_stats::stats_t stats {};
+  stats.wayland_main_device = igpu_node.string();
+
+  const auto profile = stream_stats::linux_gpu_profile_json(stats);
+
+  EXPECT_EQ(profile.at("encoder_adapter"), "");
+  EXPECT_EQ(profile.at("encoder_adapter_effective"), dgpu_node.string());
+  EXPECT_EQ(profile.at("encoder_adapter_source"), "auto");
+  EXPECT_EQ(profile.at("compositor_render_device"), igpu_node.string());
+  EXPECT_EQ(profile.at("adapter_pairing_status"), "mismatched");
+  EXPECT_EQ(profile.at("adapter_pairing_device_source"), "wayland_main_device");
+
+  const auto &warnings = profile.at("configuration_warnings");
+  const auto mismatch = std::find_if(warnings.begin(), warnings.end(), [](const auto &warning) {
+    return warning.value("id", std::string {}) == "linux_gpu_adapter_mismatch";
+  });
+  ASSERT_NE(mismatch, warnings.end());
+  const auto message = mismatch->at("message").get<std::string>();
+  const auto action = mismatch->at("action").get<std::string>();
+  EXPECT_NE(message.find("Polaris chose " + dgpu_node.string()), std::string::npos);
+  EXPECT_NE(message.find(igpu_node.string()), std::string::npos);
+  EXPECT_NE(message.find("whole-machine freezes"), std::string::npos);
+  EXPECT_NE(action.find("adapter_name = " + igpu_node.string()), std::string::npos);
+  EXPECT_NE(action.find("NVreg_DynamicPowerManagement=0x00"), std::string::npos);
+}
+
+TEST(StreamStatsLinuxGpuProfileTests, StaysUnknownWhenNeitherSideNamesANode) {
+  // The test build's automatic choice is pinned to empty, so a fixture never sees the
+  // host's real render nodes; with no compositor device either, nothing is compared.
+  LinuxDisplayConfigGuard guard;
+  config::video.adapter_name.clear();
+
+  stream_stats::stats_t stats {};
+  const auto profile = stream_stats::linux_gpu_profile_json(stats);
+
+  EXPECT_EQ(profile.at("encoder_adapter_effective"), "");
+  EXPECT_EQ(profile.at("encoder_adapter_source"), "auto");
+  EXPECT_EQ(profile.at("adapter_pairing_status"), "unknown");
+  for (const auto &warning : profile.at("configuration_warnings")) {
+    EXPECT_NE(warning.at("id"), "linux_gpu_adapter_mismatch");
+  }
+}
+
+TEST(StreamStatsLinuxGpuProfileTests, AConfiguredAdapterKeepsTheOriginalMismatchText) {
+  LinuxDisplayConfigGuard guard;
+  TempFileGuard adapter_node("configured-adapter");
+  TempFileGuard wayland_node("configured-wayland");
+  config::video.adapter_name = adapter_node.string();
+
+  stream_stats::stats_t stats {};
+  stats.wayland_main_device = wayland_node.string();
+
+  const auto profile = stream_stats::linux_gpu_profile_json(stats);
+  EXPECT_EQ(profile.at("encoder_adapter_source"), "configured");
+  EXPECT_EQ(profile.at("encoder_adapter_effective"), adapter_node.string());
+  const auto &warnings = profile.at("configuration_warnings");
+  const auto mismatch = std::find_if(warnings.begin(), warnings.end(), [](const auto &warning) {
+    return warning.value("id", std::string {}) == "linux_gpu_adapter_mismatch";
+  });
+  ASSERT_NE(mismatch, warnings.end());
+  EXPECT_NE(mismatch->at("message").get<std::string>().find("The configured encoder adapter"), std::string::npos);
+}
+#endif

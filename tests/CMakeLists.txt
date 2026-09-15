@@ -188,6 +188,7 @@ set(TEST_PLATFORM_SOURCES
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_cuda_gl_encode_device.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_cuda_ram_encode_device.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_game_mode_host.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_user_unit_override.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_gamescope_session_helper.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_graphics.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/platform/test_labwc_startup_diagnostics.cpp
@@ -246,6 +247,9 @@ set(TEST_HTTP_SOURCES
     ${CMAKE_SOURCE_DIR}/tests/unit/test_httpcommon.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_launch_mode_contract.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_launch_response_status.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_display_inventory_policy.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_kernel_gpu_lines.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_port_holder.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_launch_session_key.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_otp_claim.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_session_stop_contract.cpp

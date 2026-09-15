@@ -1807,10 +1807,17 @@ std::string get_local_ip_for_gateway() {
 
   /// Non-empty when the configured backend found nothing and auto-selection was used instead.
   static std::string capture_backend_substitution;
+  // Set by kmsgrab when a DRM framebuffer handle could not be read for want of
+  // CAP_SYS_ADMIN; cleared at the start of every evaluation.
+  static bool kms_capability_refused = false;
 
   /// False until an evaluation has actually run, so this can never report a problem it has not
   /// looked for. Doctor asks this on every report, including before startup finishes.
   static bool capture_sources_evaluated = false;
+
+#ifdef POLARIS_TESTS
+  static std::optional<std::string> selected_capture_backend_override;
+#endif
 
   const std::string &requested_capture() {
     return capture_backend_override ? *capture_backend_override : config::video.capture;
@@ -1908,6 +1915,7 @@ std::string get_local_ip_for_gateway() {
   void reevaluate_capture_sources() {
     capture_backend_override.reset();
     capture_backend_substitution.clear();
+    kms_capability_refused = false;
     capture_sources_evaluated = true;
     evaluate_capture_sources();
 
@@ -1964,10 +1972,47 @@ std::string get_local_ip_for_gateway() {
     return capture_sources_evaluated && sources.none();
   }
 
+  std::string selected_capture_backend() {
+#ifdef POLARIS_TESTS
+    if (selected_capture_backend_override) {
+      return *selected_capture_backend_override;
+    }
+#endif
+    if (!capture_sources_evaluated) {
+      return {};
+    }
+    return describe_selected_sources();
+  }
+
+  bool kms_capture_refused_for_capability() {
+    return kms_capability_refused;
+  }
+
+  void note_kms_capture_refused_for_capability() {
+    // kmsgrab found the connector and could not read a framebuffer handle. That
+    // is the capability, not the hardware, and the remedy is one command; the
+    // startup log says so once and scrolls away, so keep it where the Doctor
+    // can read it for as long as this evaluation stands (#686 follow-up).
+    kms_capability_refused = true;
+    verified_action::confirm(
+      "video.kms_capability",
+      "Read a DRM framebuffer handle for KMS capture",
+      false
+    );
+  }
+
 #ifdef POLARIS_TESTS
   void set_capture_sources_missing_for_tests(bool missing) {
     capture_sources_evaluated = missing;
     sources.reset();
+  }
+
+  void set_kms_capture_refused_for_tests(bool refused) {
+    kms_capability_refused = refused;
+  }
+
+  void set_selected_capture_backend_for_tests(std::optional<std::string> backend) {
+    selected_capture_backend_override = std::move(backend);
   }
 #endif
 
@@ -2119,6 +2164,12 @@ std::string get_local_ip_for_gateway() {
               read_sysfs_number(device_dir / "lmem_total_bytes")
             );
             candidate.boot_vga = read_sysfs_number(device_dir / "boot_vga") == 1;
+            if (is_virtual_display_driver(candidate.driver)) {
+              BOOST_LOG(info) << "render_device: skipping ["sv << candidate.path
+                              << "] driver="sv << candidate.driver
+                              << ", a virtual display with no encoder"sv;
+              continue;
+            }
             candidates.push_back(std::move(candidate));
           }
           if (ec) {
@@ -2148,6 +2199,44 @@ std::string get_local_ip_for_gateway() {
     }
 
   }  // namespace
+
+  bool is_virtual_display_driver(std::string_view driver) {
+    for (const auto known : {"evdi"sv, "vkms"sv, "hermes-kms"sv, "hermes_kms"sv, "vibeshine_drm"sv, "vibeshine-drm"sv, "udl"sv}) {
+      if (driver == known) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::vector<render_device_candidate_t> without_virtual_display_nodes(std::vector<render_device_candidate_t> candidates) {
+    std::erase_if(candidates, [](const auto &candidate) {
+      return is_virtual_display_driver(candidate.driver);
+    });
+    return candidates;
+  }
+
+#ifdef POLARIS_TESTS
+  namespace {
+    std::optional<std::string> effective_encoder_render_device_override = std::string {};
+  }
+
+  void set_effective_encoder_render_device_for_tests(std::optional<std::string> node) {
+    effective_encoder_render_device_override = std::move(node);
+  }
+#endif
+
+  std::string effective_encoder_render_device() {
+    if (!config::video.adapter_name.empty()) {
+      return config::video.adapter_name;
+    }
+#ifdef POLARIS_TESTS
+    if (effective_encoder_render_device_override) {
+      return *effective_encoder_render_device_override;
+    }
+#endif
+    return default_render_device();
+  }
 
   std::string choose_default_render_device(std::vector<render_device_candidate_t> candidates) {
     if (candidates.empty()) {
