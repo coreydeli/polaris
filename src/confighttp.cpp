@@ -79,6 +79,7 @@
 #include "doctor_actions.h"
 #include "ai_optimizer.h"
 #include "game_classifier.h"
+#include "emulator_library.h"
 #include "game_library_scanner.h"
 
 #include <curl/curl.h>
@@ -88,6 +89,9 @@
   #include <Windows.h>
 #elif __linux__
   #include "platform/linux/session_media.h"
+  #include "platform/linux/multiseat_launch_service.h"
+#include "platform/linux/spaces_setup.h"
+#include "platform/linux/spaces_setup_service.h"
   #include <pwd.h>
   #include <sys/stat.h>
   #include <unistd.h>
@@ -2911,6 +2915,470 @@ namespace confighttp {
     proc::migrate_apps(&file_tree, &app);
   }
 
+  // ROM folders: the persisted list of directories the import scans for emulator games.
+  namespace {
+    // Next to apps.json, wherever that is: the folders belong with the apps they feed.
+    std::filesystem::path library_sources_path() {
+      const std::filesystem::path apps_file {config::stream.file_apps};
+      const auto directory = apps_file.has_parent_path() ? apps_file.parent_path() : platf::appdata();
+      return directory / "library_sources.json";
+    }
+
+    std::vector<emulator_library::source_t> load_library_sources() {
+      std::error_code error;
+      const auto path = library_sources_path();
+      if (!std::filesystem::is_regular_file(path, error)) {
+        return {};
+      }
+      return emulator_library::parse_sources(file_handler::read_file(path.string().c_str()));
+    }
+
+    void save_library_sources(const std::vector<emulator_library::source_t> &sources) {
+      file_handler::write_file(library_sources_path().string().c_str(), emulator_library::serialize_sources(sources).dump(2));
+    }
+
+    std::string_view service_path_env() {
+      const char *value = std::getenv("PATH");
+      return value == nullptr ? std::string_view {} : std::string_view {value};
+    }
+
+    std::string account_home() {
+      const auto roots = game_library::library_home_roots();
+      if (!roots.empty()) {
+        return roots.front().string();
+      }
+      const char *home = std::getenv("HOME");
+      return home == nullptr ? std::string {} : std::string {home};
+    }
+
+    struct rom_folder_plan_t {
+      const emulator_library::preset_t *preset = nullptr;
+      emulator_library::install_t install;
+      std::vector<std::string> extensions;
+      std::string label;
+      std::string platform;
+      std::string warning;
+      std::vector<emulator_library::prerequisite_t> prerequisites;
+      bool folder_exists = false;
+      bool scannable = false;
+    };
+
+    nlohmann::json prerequisites_json(const std::vector<emulator_library::prerequisite_t> &checks) {
+      auto list = nlohmann::json::array();
+      for (const auto &check : checks) {
+        list.push_back({{"id", check.id}, {"severity", check.severity}, {"message", check.message}, {"action", check.action}});
+      }
+      return list;
+    }
+
+    rom_folder_plan_t plan_rom_folder(const emulator_library::source_t &source) {
+      rom_folder_plan_t plan;
+      plan.preset = emulator_library::find_preset(source.emulator);
+      std::error_code error;
+      plan.folder_exists = std::filesystem::is_directory(source.path, error);
+      plan.extensions = emulator_library::effective_extensions(source, plan.preset);
+      plan.label = emulator_library::source_label(source, plan.preset);
+      if (plan.preset != nullptr) {
+        plan.platform = std::string(plan.preset->platform);
+        const auto home_roots = game_library::library_home_roots();
+        plan.install = emulator_library::detect_install(*plan.preset, source.launcher, home_roots, service_path_env());
+        plan.prerequisites = emulator_library::prerequisites(*plan.preset, plan.install, source.path, home_roots);
+        if (plan.install.kind == emulator_library::install_e::missing) {
+          plan.warning = plan.install.location.empty() ?
+            plan.label + " is not installed on this host; imported entries launch once it is." :
+            plan.label + " was not found at " + plan.install.location + "; imported entries launch once it is back.";
+        }
+        plan.scannable = true;
+      } else {
+        plan.scannable = source.emulator == emulator_library::custom_emulator_id &&
+                         emulator_library::custom_template_valid(source.command) && !plan.extensions.empty();
+        if (!plan.scannable) {
+          plan.warning = "This folder's command or extensions are incomplete; remove it and add it again.";
+        }
+      }
+      if (!plan.folder_exists) {
+        plan.warning = "Folder not found: " + source.path;
+        plan.scannable = false;
+      }
+      return plan;
+    }
+
+    std::string rom_launch_command(const emulator_library::source_t &source, const rom_folder_plan_t &plan, const std::filesystem::path &rom) {
+      if (plan.preset != nullptr) {
+        return emulator_library::launch_command(*plan.preset, plan.install, rom);
+      }
+      return emulator_library::custom_launch_command(source.command, rom, account_home());
+    }
+
+    // One spelling per file, so a symlinked library or a trailing slash is not a second game.
+    std::string rom_identity(const std::filesystem::path &rom) {
+      std::error_code error;
+      const auto canonical = std::filesystem::weakly_canonical(rom, error);
+      return (error || canonical.empty() ? rom.lexically_normal() : canonical).string();
+    }
+
+    nlohmann::json rom_folder_json(const emulator_library::source_t &source, const rom_folder_plan_t &plan) {
+      return {
+        {"id", source.id},
+        {"path", source.path},
+        {"emulator", source.emulator},
+        {"label", plan.label},
+        {"platform", plan.platform},
+        {"launcher", source.launcher},
+        {"command", source.command},
+        {"extensions", plan.extensions},
+        {"folder_exists", plan.folder_exists},
+        {"install", {{"kind", std::string(emulator_library::install_name(plan.install.kind))}, {"location", plan.install.location}}},
+        {"warning", plan.warning},
+        {"prerequisites", prerequisites_json(plan.prerequisites)},
+      };
+    }
+
+    nlohmann::json rom_folders_json(const std::vector<emulator_library::source_t> &sources) {
+      auto folders = nlohmann::json::array();
+      for (const auto &source : sources) {
+        folders.push_back(rom_folder_json(source, plan_rom_folder(source)));
+      }
+      return folders;
+    }
+
+    nlohmann::json emulator_presets_json() {
+      auto list = nlohmann::json::array();
+      const auto home_roots = game_library::library_home_roots();
+      const auto path_env = service_path_env();
+      for (const auto &preset : emulator_library::presets()) {
+        const auto install = emulator_library::detect_install(preset, "", home_roots, path_env);
+        std::vector<std::string> extensions;
+        for (const auto extension : preset.extensions) {
+          extensions.emplace_back(extension);
+        }
+        list.push_back({
+          {"id", std::string(preset.id)},
+          {"label", std::string(preset.label)},
+          {"platform", std::string(preset.platform)},
+          {"extensions", extensions},
+          {"arguments", std::string(preset.arguments)},
+          {"gamepad", std::string(preset.gamepad)},
+          {"install", {{"kind", std::string(emulator_library::install_name(install.kind))}, {"location", install.location}}},
+          {"prerequisites", prerequisites_json(emulator_library::prerequisites(preset, install, {}, home_roots))},
+        });
+      }
+      return list;
+    }
+
+    // A cover that already sits next to the game, or in ES-DE or RetroArch media for the
+    // folder's system, copied into the covers directory so the console, Nova and the artwork
+    // cache all see it, the way the Heroic importer's download does.
+    std::optional<std::string> copy_rom_cover(
+      const emulator_library::source_t &source,
+      const rom_folder_plan_t &plan,
+      const std::filesystem::path &rom,
+      const std::filesystem::path &coverdir
+    ) {
+      const auto is_image = [](const std::filesystem::path &path) {
+        std::error_code error;
+        const auto size = std::filesystem::file_size(path, error);
+        return !error && size > 0 && size <= game_artwork::maximum_asset_bytes && game_artwork::image_mime_type(path).has_value();
+      };
+      const auto found = emulator_library::find_local_cover(rom, plan.preset, game_library::library_home_roots(), is_image);
+      if (!found) {
+        return std::nullopt;
+      }
+      const auto mime = game_artwork::image_mime_type(*found);
+      const std::string extension = !mime ? "" :
+        *mime == "image/jpeg" ? ".jpg" :
+        *mime == "image/png" ? ".png" :
+        *mime == "image/webp" ? ".webp" : "";
+      if (extension.empty()) {
+        return std::nullopt;
+      }
+      std::error_code error;
+      std::filesystem::create_directories(coverdir, error);
+      if (error) {
+        return std::nullopt;
+      }
+      const auto final_path = coverdir / (emulator_library::cover_stem(rom, source.emulator) + extension);
+      const auto temporary = coverdir / (final_path.filename().string() + ".tmp");
+      std::filesystem::remove(temporary, error);
+      error.clear();
+      std::filesystem::copy_file(*found, temporary, std::filesystem::copy_options::overwrite_existing, error);
+      if (error || !game_artwork::image_mime_type(temporary)) {
+        std::filesystem::remove(temporary, error);
+        return std::nullopt;
+      }
+      std::filesystem::remove(final_path, error);
+      error.clear();
+      std::filesystem::rename(temporary, final_path, error);
+      if (error) {
+        std::error_code cleanup;
+        std::filesystem::remove(temporary, cleanup);
+        return std::nullopt;
+      }
+      BOOST_LOG(info) << "ROM folder import: cover for [" << rom.filename().string() << "] taken from " << found->string();
+      return final_path.string();
+    }
+
+    // The file an import names, once it is proven to be a game inside its own folder.
+    std::optional<std::filesystem::path> rom_import_target(
+      const emulator_library::source_t &source,
+      const rom_folder_plan_t &plan,
+      const std::string &rom_path
+    ) {
+      if (rom_path.empty() || !plan.scannable) {
+        return std::nullopt;
+      }
+      const std::filesystem::path rom {rom_path};
+      std::error_code error;
+      if (!rom.is_absolute() || !std::filesystem::is_regular_file(rom, error)) {
+        return std::nullopt;
+      }
+      if (!emulator_library::rom_belongs_to_folder(rom, source.path)) {
+        return std::nullopt;
+      }
+      if (!emulator_library::has_extension(rom, plan.extensions)) {
+        return std::nullopt;
+      }
+      return rom.lexically_normal();
+    }
+
+    bool rom_already_published(const nlohmann::json &file_tree, const std::filesystem::path &rom, const std::string &command) {
+      if (!file_tree.contains("apps") || !file_tree["apps"].is_array()) {
+        return false;
+      }
+      const auto identity = rom_identity(rom);
+      for (const auto &app : file_tree["apps"]) {
+        if (!app.is_object()) {
+          continue;
+        }
+        if (app.contains("rom-path") && app["rom-path"].is_string() && rom_identity(app["rom-path"].get<std::string>()) == identity) {
+          return true;
+        }
+        if (app.contains("cmd") && app["cmd"].is_string() && app["cmd"].get<std::string>() == command) {
+          return true;
+        }
+        if (app.contains("detached") && app["detached"].is_array()) {
+          for (const auto &detached : app["detached"]) {
+            if (detached.is_string() && detached.get<std::string>() == command) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    }
+
+    // The emulator's own UI, published once next to its games so a stream can reach it.
+    void ensure_emulator_launcher_app(nlohmann::json &file_tree, const emulator_library::preset_t &preset, const emulator_library::install_t &install) {
+      if (!file_tree.contains("apps") || !file_tree["apps"].is_array()) {
+        file_tree["apps"] = nlohmann::json::array();
+      }
+      const auto command = emulator_library::launcher_command(preset, install);
+      const std::string label {preset.label};
+      for (const auto &app : file_tree["apps"]) {
+        if (!app.is_object()) {
+          continue;
+        }
+        if (boost::iequals(boost::trim_copy(app.value("name", "")), label)) {
+          return;
+        }
+        if (boost::trim_copy(app.value("cmd", "")) == command) {
+          return;
+        }
+        if (app.contains("detached") && app["detached"].is_array()) {
+          for (const auto &detached : app["detached"]) {
+            if (detached.is_string() && boost::trim_copy(detached.get<std::string>()) == command) {
+              return;
+            }
+          }
+        }
+      }
+      nlohmann::json app {
+        {"name", label},
+        {"uuid", ""},
+        {"cmd", command},
+        {"source", std::string(emulator_library::source_name)},
+        {"emulator", std::string(preset.id)},
+        {"auto-detach", true},
+        {"wait-all", true},
+        {"exit-timeout", 5}
+      };
+      proc::migrate_apps(&file_tree, &app);
+      BOOST_LOG(info) << "Added " << label << " to the app list next to its games.";
+    }
+
+    // The ROM folder candidates: one per file the folder's emulator can load, plus each
+    // folder as the scan saw it. Split out so a test reaches it without the Steam scan.
+    struct rom_folder_scan_t {
+      nlohmann::json games = nlohmann::json::array();
+      nlohmann::json folders = nlohmann::json::array();
+    };
+
+    rom_folder_scan_t scan_rom_folders(const std::set<std::string> &existing_cmds, const std::set<std::string> &existing_rom_paths) {
+      rom_folder_scan_t result;
+      for (const auto &rom_folder : load_library_sources()) {
+        const auto plan = plan_rom_folder(rom_folder);
+        auto folder_json = rom_folder_json(rom_folder, plan);
+        std::size_t rom_count = 0;
+        if (plan.scannable) {
+          for (const auto &rom : emulator_library::scan_folder(rom_folder.path, plan.extensions)) {
+            const auto command = rom_launch_command(rom_folder, plan, rom.path);
+            nlohmann::json game;
+            game["name"] = rom.name;
+            game["source"] = std::string(emulator_library::source_name);
+            game["emulator"] = rom_folder.emulator;
+            game["emulator_label"] = plan.label;
+            game["platform"] = plan.platform;
+            game["source_id"] = rom_folder.id;
+            game["rom_path"] = rom.path.string();
+            game["cmd"] = command;
+            game["already_imported"] = existing_rom_paths.count(rom_identity(rom.path)) > 0 || existing_cmds.count(command) > 0;
+            game["game_category"] = game_classifier::category_to_string(game_classifier::classify(rom.name, {}));
+            result.games.push_back(game);
+            ++rom_count;
+          }
+        }
+        folder_json["rom_count"] = rom_count;
+        result.folders.push_back(folder_json);
+      }
+      std::sort(result.games.begin(), result.games.end(),
+        [](const nlohmann::json &a, const nlohmann::json &b) {
+          return a["name"].get<std::string>() < b["name"].get<std::string>();
+        });
+      return result;
+    }
+  }  // namespace
+
+  nlohmann::json rom_folder_scan_for_tests(const std::set<std::string> &existing_cmds, const std::set<std::string> &existing_rom_paths) {
+    const auto scan = scan_rom_folders(existing_cmds, existing_rom_paths);
+    return {{"emulator_games", scan.games}, {"library_sources", scan.folders}};
+  }
+
+  /**
+   * @brief List the ROM folders and the emulator presets, with where each emulator is on this host.
+   *
+   * @api_examples{/api/library/sources| GET| null}
+   */
+  void getLibrarySources(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+    print_req(request);
+
+    nlohmann::json output;
+    output["status"] = true;
+    output["presets"] = emulator_presets_json();
+    output["sources"] = rom_folders_json(load_library_sources());
+    send_response(response, output);
+  }
+
+  /**
+   * @brief Add a ROM folder, or update the one already registered for the same folder and emulator.
+   *
+   * The body carries `path` and `emulator` (a preset id, or `custom` with `command` and
+   * `extensions`), and optionally `launcher`, the emulator file to run instead of PATH or
+   * the Flatpak. `~/` is expanded against the account's home.
+   *
+   * @api_examples{/api/library/sources| POST| {"path":"~/Games/switch","emulator":"eden"}}
+   */
+  void addLibrarySource(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) return;
+    print_req(request);
+
+    nlohmann::json output;
+    try {
+      std::stringstream ss;
+      ss << request->content.rdbuf();
+      const auto body = nlohmann::json::parse(ss.str());
+      const auto home = account_home();
+      const auto string_field = [&body](const char *key) {
+        const auto it = body.find(key);
+        return it != body.end() && it->is_string() ? boost::trim_copy(it->get<std::string>()) : std::string {};
+      };
+
+      emulator_library::source_t source;
+      source.id = uuid_util::uuid_t::generate().string();
+      source.path = emulator_library::expand_home(string_field("path"), home);
+      source.emulator = string_field("emulator");
+      source.launcher = emulator_library::expand_home(string_field("launcher"), home);
+      source.command = string_field("command");
+      if (const auto extensions = body.find("extensions"); extensions != body.end()) {
+        if (extensions->is_array()) {
+          std::vector<std::string> raw;
+          for (const auto &extension : *extensions) {
+            if (extension.is_string()) {
+              raw.push_back(extension.get<std::string>());
+            }
+          }
+          source.extensions = emulator_library::normalize_extensions(raw);
+        } else if (extensions->is_string()) {
+          source.extensions = emulator_library::parse_extension_list(extensions->get<std::string>());
+        }
+      }
+      // A preset carries no template of its own, and a custom command names its emulator itself.
+      if (source.emulator == emulator_library::custom_emulator_id) {
+        source.launcher.clear();
+      } else {
+        source.command.clear();
+      }
+      if (const auto problem = emulator_library::validate_source(source); problem) {
+        bad_request(response, request, *problem);
+        return;
+      }
+      source.path = std::filesystem::path(source.path).lexically_normal().string();
+      if (source.path.size() > 1 && source.path.back() == '/') {
+        source.path.pop_back();
+      }
+
+      auto sources = load_library_sources();
+      const auto identity = rom_identity(source.path);
+      const auto existing = std::find_if(sources.begin(), sources.end(), [&](const emulator_library::source_t &candidate) {
+        return candidate.emulator == source.emulator && rom_identity(candidate.path) == identity;
+      });
+      if (existing != sources.end()) {
+        source.id = existing->id;
+        *existing = source;
+      } else {
+        sources.push_back(source);
+      }
+      save_library_sources(sources);
+
+      output["status"] = true;
+      output["source"] = rom_folder_json(source, plan_rom_folder(source));
+      output["sources"] = rom_folders_json(sources);
+    } catch (const std::exception &e) {
+      output["status"] = false;
+      output["error"] = e.what();
+    }
+    send_response(response, output);
+  }
+
+  /**
+   * @brief Remove a ROM folder. Entries already imported from it stay.
+   *
+   * @api_examples{/api/library/sources/<id>| DELETE| null}
+   */
+  void deleteLibrarySource(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+    print_req(request);
+
+    const std::string id = request->path_match.size() > 1 ? request->path_match[1].str() : std::string {};
+    auto sources = load_library_sources();
+    const auto before = sources.size();
+    sources.erase(std::remove_if(sources.begin(), sources.end(), [&](const emulator_library::source_t &candidate) {
+      return candidate.id == id;
+    }), sources.end());
+
+    nlohmann::json output;
+    if (sources.size() == before) {
+      output["status"] = false;
+      output["error"] = "Unknown ROM folder";
+      send_response(response, output);
+      return;
+    }
+    save_library_sources(sources);
+    output["status"] = true;
+    output["sources"] = rom_folders_json(sources);
+    send_response(response, output);
+  }
+
   void scanGames(resp_https_t response, req_https_t request) {
     if (!authenticate(response, request)) return;
     print_req(request);
@@ -2922,6 +3390,7 @@ namespace confighttp {
     std::set<std::string> existing_cmds;
     std::set<std::string> existing_lutris_slugs;
     std::set<std::string> existing_heroic_keys;
+    std::set<std::string> existing_rom_paths;
     try {
       std::string content = file_handler::read_file(config::stream.file_apps.c_str());
       auto apps_tree = nlohmann::json::parse(content);
@@ -2934,6 +3403,9 @@ namespace confighttp {
           }
           if (app.contains("cmd") && app["cmd"].is_string()) {
             existing_cmds.insert(app["cmd"].get<std::string>());
+          }
+          if (app.contains("rom-path") && app["rom-path"].is_string()) {
+            existing_rom_paths.insert(rom_identity(app["rom-path"].get<std::string>()));
           }
           const auto app_source = app.contains("source") && app["source"].is_string() ? app["source"].get<std::string>() : "";
           if (boost::iequals(app_source, "lutris")) {
@@ -3248,6 +3720,9 @@ namespace confighttp {
       }
     }
 
+    // Scan the ROM folders: one candidate per file the folder's emulator can load
+    const auto rom_folder_scan = scan_rom_folders(existing_cmds, existing_rom_paths);
+
     // Sort all by name
     std::sort(steam_games.begin(), steam_games.end(),
       [](const nlohmann::json &a, const nlohmann::json &b) {
@@ -3265,6 +3740,8 @@ namespace confighttp {
     output["steam_games"] = steam_games;
     output["lutris_games"] = lutris_games;
     output["heroic_games"] = heroic_games;
+    output["emulator_games"] = rom_folder_scan.games;
+    output["library_sources"] = rom_folder_scan.folders;
     output["status"] = true;
     send_response(response, output);
   }
@@ -3296,6 +3773,9 @@ namespace confighttp {
       int imported = 0;
       bool imported_lutris_game = false;
       std::optional<game_library::launcher_install_t> imported_heroic_install;
+      std::vector<emulator_library::source_t> rom_folders;
+      bool rom_folders_loaded = false;
+      std::set<std::string> imported_rom_folders;  // ids, so each emulator is published once
       for (const auto &game : body["games"]) {
         std::string name = game.value("name", "");
         std::string source = game.value("source", "steam");
@@ -3445,6 +3925,50 @@ namespace confighttp {
               app["image-path"] = *cover_path;
             }
           }
+        } else if (source == "emulator") {
+          // The browser names the file and the folder it was scanned from; the command,
+          // the pad and the entry's identity are rebuilt here from the persisted folder.
+          if (!rom_folders_loaded) {
+            rom_folders = load_library_sources();
+            rom_folders_loaded = true;
+          }
+          const auto source_id = game.value("source_id", "");
+          const auto rom_path = game.value("rom_path", "");
+          const auto folder = std::find_if(rom_folders.begin(), rom_folders.end(), [&](const emulator_library::source_t &candidate) {
+            return candidate.id == source_id;
+          });
+          if (folder == rom_folders.end()) {
+            bad_request(response, request, "Unknown ROM folder for " + name);
+            return;
+          }
+          const auto plan = plan_rom_folder(*folder);
+          const auto rom = rom_import_target(*folder, plan, rom_path);
+          if (!rom) {
+            bad_request(response, request, "Not a game file inside its ROM folder: " + rom_path);
+            return;
+          }
+          const auto command = rom_launch_command(*folder, plan, *rom);
+          if (rom_already_published(fileTree, *rom, command)) {
+            continue;
+          }
+          app["cmd"] = command;
+          // The emulator is the game: when it dies within seconds the session should end and
+          // the client return to its library, not stream an empty compositor; and a save
+          // flush deserves more than the default grace.
+          app["auto-detach"] = false;
+          app["exit-timeout"] = 10;
+          app["emulator"] = folder->emulator;
+          app["rom-folder"] = folder->id;
+          app["rom-path"] = rom->string();
+          if (const auto cover = copy_rom_cover(*folder, plan, *rom, library_sources_path().parent_path() / "covers"); cover) {
+            app["image-path"] = *cover;
+          }
+          if (plan.preset != nullptr && !plan.preset->gamepad.empty()) {
+            app["gamepad"] = std::string(plan.preset->gamepad);
+          }
+          if (plan.preset != nullptr) {
+            imported_rom_folders.insert(folder->id);
+          }
         }
 
         // Persist game classification metadata
@@ -3466,6 +3990,18 @@ namespace confighttp {
 
       if (imported_heroic_install) {
         ensure_heroic_library_app(fileTree, *imported_heroic_install);
+      }
+
+      for (const auto &folder_id : imported_rom_folders) {
+        const auto folder = std::find_if(rom_folders.begin(), rom_folders.end(), [&](const emulator_library::source_t &candidate) {
+          return candidate.id == folder_id;
+        });
+        if (folder == rom_folders.end()) {
+          continue;
+        }
+        if (const auto plan = plan_rom_folder(*folder); plan.preset != nullptr) {
+          ensure_emulator_launcher_app(fileTree, *plan.preset, plan.install);
+        }
       }
 
       // Write back
@@ -3642,6 +4178,211 @@ namespace confighttp {
   }
 
   // ---- Client Profile CRUD API ----
+
+  void getSpacesSetup(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+#ifdef __linux__
+    multiseat::container::local_host_t host;
+    const auto service = multiseat::installed_profile_service();
+    const bool available = service && service->admin_snapshot().available;
+    send_response(response, multiseat::spaces::inspect_setup(host, config::multiseat.enabled, available));
+#else
+    not_found(response, request);
+#endif
+  }
+
+  void getSpacesSetupJob(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+#ifdef __linux__
+    if (const auto service = multiseat::spaces::installed_setup_service()) {
+      send_response(response, service->snapshot());
+      return;
+    }
+#endif
+    not_found(response, request);
+  }
+
+  void updateSpacesSetupJob(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request) || !validateContentType(response, request, "application/json")) return;
+#ifdef __linux__
+    const auto service = multiseat::spaces::installed_setup_service();
+    if (!service) { not_found(response, request); return; }
+    std::array<char, 4097> bytes;
+    request->content.read(bytes.data(), bytes.size());
+    const auto count = request->content.gcount();
+    if (count > 4096) { bad_request(response, request, "Setup request is too large"); return; }
+    const auto action = multiseat::spaces::decode_setup_request({bytes.data(), static_cast<std::size_t>(count)});
+    if (!action) { bad_request(response, request, "Invalid Spaces setup request"); return; }
+    const auto status = service->submit(*action);
+    auto output = service->snapshot();
+    output["accepted"] = status == 200 || status == 202;
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    append_json_security_headers(headers);
+    response->write(static_cast<SimpleWeb::StatusCode>(status), output.dump(), headers);
+#else
+    not_found(response, request);
+#endif
+  }
+
+  void registerSpacesSetupRoutes(SimpleWeb::ServerBase<SimpleWeb::HTTPS> &server) {
+    server.resource["^/api/spaces/setup$"]["GET"] = getSpacesSetup;
+    server.resource["^/api/spaces/setup/job$"]["GET"] = getSpacesSetupJob;
+    server.resource["^/api/spaces/setup/job$"]["POST"] = withCsrf(updateSpacesSetupJob);
+  }
+
+  void getMultiseatProfiles(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+    nlohmann::json output {{"enabled", false}, {"available", false}, {"changing", false},
+      {"failed", false}, {"profiles", nlohmann::json::array()}, {"activity", nlohmann::json::array()}, {"creation_available", false}, {"management_available", false}, {"access_available", false}};
+#ifdef __linux__
+    if (const auto service = multiseat::installed_profile_service()) {
+      const auto state = service->admin_snapshot();
+      output["enabled"] = true; output["available"] = state.available;
+      output["changing"] = state.changing; output["failed"] = state.failed;
+      output["creation_available"] = state.creation_available;
+      output["management_available"] = state.management_available;
+      output["access_available"] = state.management_available;
+      output["desktop_clients"] = state.desktop_clients;
+      for (const auto &activity : state.activity)
+        output["activity"].push_back({{"profile_id", activity.profile}, {"client_id", activity.client}, {"state", activity.state}});
+      for (const auto &profile : state.profiles)
+        output["profiles"].push_back({{"id", profile.id}, {"name", profile.name}, {"clients", profile.clients},
+          {"steam", profile.steam}, {"archived", profile.archived}, {"access_clients", profile.access_clients}});
+    }
+#endif
+    send_response(response, output);
+  }
+
+  void createMultiseatProfile(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request) || !validateContentType(response, request, "application/json")) return;
+#ifdef __linux__
+    const auto service = multiseat::installed_profile_service();
+    if (!service) { bad_request(response, request, "Multiseat is not configured"); return; }
+    std::array<char, 4097> bytes;
+    request->content.read(bytes.data(), bytes.size());
+    const auto count = request->content.gcount();
+    if (count > 4096) { bad_request(response, request, "Creation request is too large"); return; }
+    const auto creation = multiseat::profiles::decode_steam_create_request({bytes.data(), static_cast<std::size_t>(count)});
+    if (!creation) { bad_request(response, request, "Invalid profile creation request"); return; }
+    const auto result = service->create_steam_profile(*creation);
+    const nlohmann::json output {{"status", result.prepared()}, {"message", result.message},
+      {"profile_id", creation->request_id}};
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    append_json_security_headers(headers);
+    response->write(static_cast<SimpleWeb::StatusCode>(result.status), output.dump(), headers);
+#else
+    not_found(response, request);
+#endif
+  }
+
+  void editMultiseatProfile(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request) || !validateContentType(response, request, "application/json")) return;
+#ifdef __linux__
+    const auto service = multiseat::installed_profile_service();
+    if (!service) { bad_request(response, request, "Spaces are not configured"); return; }
+    std::array<char, 4097> bytes;
+    request->content.read(bytes.data(), bytes.size());
+    const auto count = request->content.gcount();
+    if (count > 4096) { bad_request(response, request, "Space change is too large"); return; }
+    const auto edit = multiseat::profiles::decode_edit_request({bytes.data(), static_cast<std::size_t>(count)});
+    if (!edit) { bad_request(response, request, "Invalid space change"); return; }
+    const auto result = service->edit_profile(*edit);
+    const nlohmann::json output {{"status", result.prepared()}, {"message", result.message}, {"profile_id", edit->profile_id}};
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    append_json_security_headers(headers);
+    response->write(static_cast<SimpleWeb::StatusCode>(result.status), output.dump(), headers);
+#else
+    not_found(response, request);
+#endif
+  }
+
+  void setMultiseatAssignment(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request) || !validateContentType(response, request, "application/json")) return;
+#ifdef __linux__
+    const auto service = multiseat::installed_profile_service();
+    if (!service) { bad_request(response, request, "Multiseat is not configured"); return; }
+    try {
+      std::array<char, 4097> bytes;
+      request->content.read(bytes.data(), bytes.size());
+      const auto count = request->content.gcount();
+      if (count > 4096) { bad_request(response, request, "Assignment request is too large"); return; }
+      std::set<std::string> keys;
+      const auto body = nlohmann::json::parse(bytes.data(), bytes.data() + count,
+        [&](int depth, nlohmann::json::parse_event_t event, nlohmann::json &value) {
+          if (depth > 2) throw std::invalid_argument("assignment nesting");
+          if (event == nlohmann::json::parse_event_t::key && !keys.insert(value.get<std::string>()).second)
+            throw std::invalid_argument("duplicate field");
+          return true;
+        });
+      if (!body.is_object() || body.size() != 2 || !body.contains("profile_id") || !body.contains("client_id"))
+        throw std::invalid_argument("assignment fields");
+      const auto profile = body.at("profile_id").get<std::string>();
+      const auto client = body.at("client_id").get<std::string>();
+      const auto devices = nvhttp::get_all_clients();
+      const auto device = std::find_if(devices.begin(), devices.end(),
+        [&](const auto &item) { return item.at("uuid").template get<std::string>() == client; });
+      if ((!profile.empty() && (device == devices.end() || device->at("temporary_authorization").get<bool>() ||
+           !(device->at("perm").get<std::uint32_t>() & static_cast<std::uint32_t>(crypto::PERM::launch)))) ||
+          (profile.empty() && device == devices.end() && !service->routes_client(client))) {
+        bad_request(response, request, "Select a permanently paired device with launch permission");
+        return;
+      }
+      const auto result = service->set_assignment(profile, client);
+      const nlohmann::json output {{"status", result.status == 200}, {"message", result.message}};
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      append_json_security_headers(headers);
+      response->write(static_cast<SimpleWeb::StatusCode>(result.status), output.dump(), headers);
+    } catch (const std::exception &) {
+      bad_request(response, request, "Invalid assignment request");
+    }
+#else
+    not_found(response, request);
+#endif
+  }
+
+  void setMultiseatAccess(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request) || !validateContentType(response, request, "application/json")) return;
+#ifdef __linux__
+    const auto service = multiseat::installed_profile_service();
+    if (!service) { bad_request(response, request, "Multiseat is not configured"); return; }
+    try {
+      std::array<char, 4097> bytes;
+      request->content.read(bytes.data(), bytes.size());
+      const auto count = request->content.gcount();
+      if (count > 4096) { bad_request(response, request, "Assignment request is too large"); return; }
+      std::set<std::string> keys;
+      const auto body = nlohmann::json::parse(bytes.data(), bytes.data() + count,
+        [&](int depth, nlohmann::json::parse_event_t event, nlohmann::json &value) {
+          if (depth > 2) throw std::invalid_argument("assignment nesting");
+          if (event == nlohmann::json::parse_event_t::key && !keys.insert(value.get<std::string>()).second)
+            throw std::invalid_argument("duplicate field");
+          return true;
+        });
+      if (!body.is_object() || body.size() != 3 || !body.contains("profile_id") || !body.contains("client_id") || !body.contains("allowed") || !body.at("allowed").is_boolean())
+        throw std::invalid_argument("assignment fields");
+      const auto profile = body.at("profile_id").get<std::string>();
+      const auto client = body.at("client_id").get<std::string>();
+      const auto devices = nvhttp::get_all_clients();
+      const auto device = std::find_if(devices.begin(), devices.end(),
+        [&](const auto &item) { return item.at("uuid").template get<std::string>() == client; });
+      if ((!profile.empty() && (device == devices.end() || device->at("temporary_authorization").get<bool>() ||
+           !(device->at("perm").get<std::uint32_t>() & static_cast<std::uint32_t>(crypto::PERM::launch)))) ||
+          (profile.empty() && device == devices.end() && !service->routes_client(client))) {
+        bad_request(response, request, "Select a permanently paired device with launch permission");
+        return;
+      }
+      const auto result = service->set_access(profile, client, body.at("allowed").get<bool>());
+      const nlohmann::json output {{"status", result.status == 200}, {"message", result.message}};
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      append_json_security_headers(headers);
+      response->write(static_cast<SimpleWeb::StatusCode>(result.status), output.dump(), headers);
+    } catch (const std::exception &) {
+      bad_request(response, request, "Invalid assignment request");
+    }
+#else
+    not_found(response, request);
+#endif
+  }
 
   // ---- Device Database API ----
 
@@ -4308,6 +5049,7 @@ namespace confighttp {
     }
     auto vars = config::parse_config(observed->contents);
     for (auto &[name, value] : vars) {
+      if (validation::is_local_config_key(name)) continue;
       if (is_write_only_secret_config_key(name)) {
         if (name == "ai_api_key") {
           output_tree["has_ai_api_key"] = !value.empty();
@@ -4527,8 +5269,10 @@ namespace confighttp {
       observed_revision.value_or(configuration_store::revision(config::sunshine.config_file, true)));
     std::stringstream config_stream;
     const auto existing_vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+    auto persisted = tree;
+    validation::preserve_local_config(existing_vars, persisted);
     std::vector<std::string> written_keys;
-    for (const auto &[k, v] : tree.items()) {
+    for (const auto &[k, v] : persisted.items()) {
       if (v.is_null()) {
         continue;
       }
@@ -4538,7 +5282,7 @@ namespace confighttp {
       // v.dump() will dump valid json, which we do not want for strings in the config right now
       // we should migrate the config file to straight json and get rid of all this nonsense
       config_stream << k << " = " << (v.is_string() ? v.get<std::string>() : v.dump()) << std::endl;
-      written_keys.push_back(k);
+      if (!validation::is_local_config_key(k)) written_keys.push_back(k);
     }
     if (!tree.contains("adaptive_bitrate_enabled")) {
       config_stream << "adaptive_bitrate_enabled = "
@@ -4546,7 +5290,7 @@ namespace confighttp {
     }
     std::size_t dropped = 0;
     for (const auto &[key, value] : existing_vars) {
-      if (tree.contains(key) || value.empty()) {
+      if (persisted.contains(key) || value.empty()) {
         continue;
       }
       if (is_write_only_secret_config_key(key)) {
@@ -7600,6 +8344,9 @@ namespace confighttp {
     server.resource["^/api/apps/close$"]["POST"] = withCsrf(closeApp);
     server.resource["^/api/games/scan$"]["GET"] = scanGames;
     server.resource["^/api/games/import$"]["POST"] = withCsrf(importGames);
+    server.resource["^/api/library/sources$"]["GET"] = getLibrarySources;
+    server.resource["^/api/library/sources$"]["POST"] = withCsrf(addLibrarySource);
+    server.resource["^/api/library/sources/([^/]+)$"]["DELETE"] = withCsrf(deleteLibrarySource);
     server.resource["^/polaris/v1/diagnostics/logs/tail$"]["GET"] = getLogTail;
     server.resource["^/polaris/v1/diagnostics/logs/previous$"]["GET"] = getPreviousLogs;
     server.resource["^/polaris/v1/diagnostics/kernel-gpu$"]["GET"] = getKernelGpuMessages;
@@ -7637,6 +8384,12 @@ namespace confighttp {
     server.resource["^/api/devices$"]["GET"] = getDevices;
     server.resource["^/api/devices/suggest$"]["GET"] = getDeviceSuggestion;
     server.resource["^/api/clients/profiles$"]["GET"] = getClientProfiles;
+    registerSpacesSetupRoutes(server);
+    server.resource["^/api/multiseat/profiles$"]["GET"] = getMultiseatProfiles;
+    server.resource["^/api/multiseat/profiles$"]["POST"] = withCsrf(createMultiseatProfile);
+    server.resource["^/api/multiseat/profiles/manage$"]["POST"] = withCsrf(editMultiseatProfile);
+    server.resource["^/api/multiseat/assign$"]["POST"] = withCsrf(setMultiseatAssignment);
+    server.resource["^/api/multiseat/access$"]["POST"] = withCsrf(setMultiseatAccess);
     server.resource["^/api/clients/profiles/update$"]["POST"] = withCsrf(updateClientProfile);
     server.resource["^/api/clients/profiles/delete$"]["POST"] = withCsrf(deleteClientProfile);
     server.resource["^/api/covers/upload$"]["POST"] = withCsrf(uploadCover);

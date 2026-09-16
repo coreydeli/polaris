@@ -91,6 +91,74 @@
         </div>
       </div>
 
+      <section class="surface-subtle mt-5 p-4" data-rom-folders>
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div class="min-w-0">
+            <div class="section-kicker">ROM folders</div>
+            <div class="text-sm font-semibold text-silver">Emulator games</div>
+            <p class="mt-1 text-sm text-storm">Point Polaris at a folder of games and pick the emulator that loads them. Every file it can load becomes an entry named from its filename; covers come from SteamGridDB when a key is set in Settings.</p>
+          </div>
+          <Button variant="outline" size="sm" data-rom-folder-add @click="showRomSourceForm ? closeRomSourceForm() : openRomSourceForm()">
+            {{ showRomSourceForm ? 'Cancel' : 'Add folder' }}
+          </Button>
+        </div>
+
+        <form v-if="showRomSourceForm" class="mt-4 grid gap-3 sm:grid-cols-2" data-rom-folder-form @submit.prevent="submitRomSource">
+          <div class="app-editor-field">
+            <label for="romFolderPath" class="settings-field-label">Folder</label>
+            <input id="romFolderPath" type="text" class="app-editor-input" v-model="romSourceForm.path" placeholder="~/Games/switch" autocomplete="off" />
+          </div>
+          <div class="app-editor-field">
+            <label for="romFolderEmulator" class="settings-field-label">Emulator</label>
+            <select id="romFolderEmulator" class="app-editor-input" v-model="romSourceForm.emulator">
+              <option v-for="preset in romPresets" :key="preset.id" :value="preset.id">{{ preset.label }} ({{ preset.platform }})</option>
+              <option :value="CUSTOM_EMULATOR">Custom command</option>
+            </select>
+            <div v-for="check in selectedRomPreset?.prerequisites || []" :key="check.id" class="mt-1 text-xs" :class="check.severity === 'warning' ? 'text-warning-bright' : 'text-storm'" data-rom-preset-check>
+              {{ check.message }} <span class="font-mono">{{ check.action }}</span>
+            </div>
+          </div>
+          <template v-if="romSourceIsCustom">
+            <div class="app-editor-field">
+              <label for="romFolderCommand" class="settings-field-label">Command</label>
+              <input id="romFolderCommand" type="text" class="app-editor-input app-editor-input-mono" v-model="romSourceForm.command" placeholder="retroarch -f -L ~/.config/retroarch/cores/snes9x_libretro.so {rom}" autocomplete="off" />
+              <div class="mt-1 text-xs text-storm">{rom} is replaced with the game file, quoted.</div>
+            </div>
+            <div class="app-editor-field">
+              <label for="romFolderExtensions" class="settings-field-label">File extensions</label>
+              <input id="romFolderExtensions" type="text" class="app-editor-input" v-model="romSourceForm.extensions" placeholder="sfc, smc, zip" autocomplete="off" />
+            </div>
+          </template>
+          <div v-else class="app-editor-field">
+            <label for="romFolderLauncher" class="settings-field-label">Emulator file (optional)</label>
+            <input id="romFolderLauncher" type="text" class="app-editor-input app-editor-input-mono" v-model="romSourceForm.launcher" placeholder="~/Apps/Eden.AppImage" autocomplete="off" />
+            <div class="mt-1 text-xs text-storm">Leave blank to use the binary on PATH or the Flatpak.</div>
+          </div>
+          <div v-if="romSourceError" class="text-xs text-warning-bright sm:col-span-2" data-rom-folder-error>{{ romSourceError }}</div>
+          <div class="flex flex-wrap gap-2 sm:col-span-2">
+            <Button type="button" variant="primary" size="sm" :disabled="romSourceSaving" :loading="romSourceSaving" data-rom-folder-save @click="submitRomSource">Add folder</Button>
+          </div>
+        </form>
+
+        <div v-if="romSourceCards.length" class="mt-4 grid gap-2">
+          <article v-for="source in romSourceCards" :key="source.id" class="library-import-review-row" data-rom-folder>
+            <div class="min-w-0">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-sm font-semibold text-silver">{{ romSourceInstallLabel(source) }}</span>
+                <span class="control-chip">{{ romSourceCountLabel(source) }}</span>
+              </div>
+              <div class="mt-1 break-all font-mono text-xs text-storm">{{ source.path }}</div>
+              <div v-if="source.warning" class="mt-1 text-xs text-warning-bright">{{ source.warning }}</div>
+              <div v-for="check in source.prerequisites || []" :key="check.id" class="mt-1 text-xs" :class="check.severity === 'warning' ? 'text-warning-bright' : 'text-storm'" data-rom-folder-check>
+                {{ check.message }} <span class="font-mono break-all">{{ check.action }}</span>
+              </div>
+            </div>
+            <Button variant="ghost" size="sm" :disabled="romSourceSaving" data-rom-folder-remove @click="removeRomSource(source)">Remove</Button>
+          </article>
+        </div>
+        <div v-else-if="!showRomSourceForm" class="mt-3 text-xs text-storm">No ROM folders yet.</div>
+      </section>
+
       <div v-if="hasImportSources" class="library-import-overview">
         <div class="library-import-metric">
           <span>New</span>
@@ -144,7 +212,7 @@
             <div class="min-w-0">
               <div class="flex flex-wrap items-center gap-2">
                 <span class="truncate text-sm font-semibold text-silver">{{ game.name }}</span>
-                <span class="control-chip">{{ sourceLabel(game.source) }}</span>
+                <span class="control-chip">{{ importSourceChip(game) }}</span>
                 <span class="control-chip">{{ importGameStateLabel(game) }}</span>
               </div>
               <div class="mt-1 text-xs text-storm">{{ importGameStateCopy(game) }}</div>
@@ -177,6 +245,7 @@
         <div class="mt-4 flex items-center justify-center gap-2">
           <h3 class="text-lg font-semibold text-silver">Ready to scan installed libraries</h3>
         </div>
+        <p class="mt-2 text-sm text-storm">Steam, Lutris and Heroic are found on their own. Add a ROM folder above to bring emulator games in too.</p>
         <div class="mt-5">
           <Button variant="primary" :disabled="gameScanning" @click="scanGames">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 1 1-14 0 7 7 0 0 1 14 0z"/></svg>
@@ -188,7 +257,7 @@
       <div v-else-if="gameScanning" class="mt-5 rounded-lg border border-storm/20 bg-deep/35 px-5 py-10 text-center" role="status" aria-live="polite">
         <svg class="mx-auto h-7 w-7 animate-spin text-ice" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" /><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4Zm2 5.291A7.962 7.962 0 0 1 4 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647Z" /></svg>
         <h3 class="mt-4 text-lg font-semibold text-silver">Scanning installed libraries</h3>
-        <p class="mt-2 text-sm text-storm">Checking Steam, Lutris, and Heroic for new, staged, and already-imported entries.</p>
+        <p class="mt-2 text-sm text-storm">Checking Steam, Lutris, Heroic and your ROM folders for new, staged, and already-imported entries.</p>
       </div>
 
       <div v-else class="library-import-workspace">
@@ -263,7 +332,7 @@
           <div v-else class="library-import-game-grid">
             <label
               v-for="game in visibleImportGames"
-              :key="game.appid || game.slug || game.name"
+              :key="importGameKey(game)"
               class="library-import-game-card"
               :class="game.already_imported ? 'is-imported' : game.selected ? 'is-selected' : ''"
             >
@@ -280,6 +349,8 @@
                   <span v-if="game.appid" class="control-chip">{{ game.appid }}</span>
                   <span v-if="game.runner" class="control-chip">{{ game.runner }}</span>
                   <span v-if="game.slug" class="control-chip">{{ game.slug }}</span>
+                  <span v-if="game.emulator_label" class="control-chip">{{ game.emulator_label }}</span>
+                  <span v-if="game.source === 'emulator' && game.platform" class="control-chip">{{ game.platform }}</span>
                   <span v-if="game.game_category && game.game_category !== 'unknown'" class="control-chip">{{ formatCategory(game.game_category) }}</span>
                 </div>
               </div>
@@ -570,6 +641,10 @@
             <span>Published</span>
             <strong>{{ appCount }}</strong>
           </div>
+          <div v-if="romSourceCards.length" class="library-health-chip" data-rom-readiness-chip>
+            <span>Emulators ready</span>
+            <strong>{{ romSourceReadyCount }}/{{ romSourceCards.length }}</strong>
+          </div>
         </div>
 
         <div class="mt-5 space-y-3">
@@ -584,6 +659,18 @@
               </div>
               <div v-if="!importSources.length" class="rounded-xl border border-storm/15 bg-void/40 px-3 py-3 text-sm text-storm">
                 Scan libraries to see import candidates here.
+              </div>
+            </div>
+          </article>
+
+          <article v-if="romSourceCards.length" class="surface-subtle p-4" data-rom-readiness>
+            <div class="section-title-row">
+              <div class="text-sm font-semibold text-silver">Emulator readiness</div>
+            </div>
+            <div class="mt-3 grid gap-2">
+              <div v-for="source in romSourceCards" :key="source.id" class="flex items-start justify-between gap-3 rounded-xl border border-storm/15 bg-void/40 px-3 py-2">
+                <span class="text-sm text-silver">{{ romSourceInstallLabel(source) }}</span>
+                <span class="text-right text-xs" :class="romSourceReady(source) ? 'text-success' : 'text-warning-bright'">{{ romSourceStatus(source) }}</span>
               </div>
             </div>
           </article>
@@ -1051,7 +1138,7 @@
 </template>
 
 <script setup>
-import { computed, ref, inject } from 'vue'
+import { computed, ref, inject, watch } from 'vue'
 import Checkbox from '../Checkbox.vue'
 import Button from '../components/Button.vue'
 import { useToast } from '../composables/useToast'
@@ -1059,11 +1146,16 @@ import { useGameScanner } from '../composables/useGameScanner'
 import { filterLibraryApps } from '../library-filters'
 import { isLaunchReadyApp, launchPriorityDetails, quickLaunchApps as buildQuickLaunchApps } from '../library-launch-priority'
 import { filterImportGames, summarizeImportGames } from '../library-imports'
+import { useRomSources } from '../composables/useRomSources'
+import {
+  CUSTOM_EMULATOR, blankRomSourceForm, romSourceCountLabel, romSourceInstallLabel, romSourcePayload, romSourceReady, romSourceStatus,
+  validateRomSourceForm
+} from '../rom-sources'
 
 const { toast: showToast } = useToast()
 const {
   scanning: gameScanning, importing: gameImporting,
-  steamGames, lutrisGames, heroicGames,
+  steamGames, lutrisGames, heroicGames, emulatorGames, librarySources,
   error: gameScanError,
   scan: scanGames, importSelected, toggleAll: gameToggleAll
 } = useGameScanner()
@@ -1072,6 +1164,52 @@ const showImportReview = ref(false)
 const importTab = ref('steam')
 const importSearch = ref('')
 const importStatus = ref('new')
+const {
+  presets: romPresets, sources: romSources, saving: romSourceSaving,
+  error: romSourceRequestError, load: loadRomSources, add: addRomSource, remove: removeRomSourceById
+} = useRomSources()
+const showRomSourceForm = ref(false)
+const romSourceFormError = ref('')
+const romSourceForm = ref(blankRomSourceForm())
+const romSourceIsCustom = computed(() => romSourceForm.value.emulator === CUSTOM_EMULATOR)
+const selectedRomPreset = computed(() => romPresets.value.find((preset) => preset.id === romSourceForm.value.emulator) || null)
+const romSourceReadyCount = computed(() => romSourceCards.value.filter((source) => romSourceReady(source)).length)
+const romSourceError = computed(() => romSourceFormError.value || romSourceRequestError.value || '')
+// The registered folders, with what the last scan learned about each (games found, warnings).
+const romSourceCards = computed(() => romSources.value.map((source) => {
+  const scanned = librarySources.value.find((entry) => entry.id === source.id)
+  return scanned ? { ...source, ...scanned } : source
+}))
+
+function openRomSourceForm() {
+  romSourceFormError.value = ''
+  romSourceForm.value = blankRomSourceForm(romPresets.value)
+  showRomSourceForm.value = true
+}
+
+function closeRomSourceForm() {
+  showRomSourceForm.value = false
+  romSourceFormError.value = ''
+}
+
+async function submitRomSource() {
+  romSourceFormError.value = validateRomSourceForm(romSourceForm.value, romPresets.value)
+  if (romSourceFormError.value) return
+  if (!(await addRomSource(romSourcePayload(romSourceForm.value)))) return
+  closeRomSourceForm()
+  showToast('ROM folder added', 'success')
+  await scanGames()
+}
+
+async function removeRomSource(source) {
+  if (!(await removeRomSourceById(source.id))) return
+  showToast('ROM folder removed', 'success')
+  await scanGames()
+}
+
+watch(showImport, (open) => {
+  if (open) loadRomSources()
+})
 async function doImport() {
   const count = await importSelected()
   if (count > 0) {
@@ -1146,6 +1284,7 @@ const libraryFilters = computed(() => ([
   { key: 'all', label: 'All', count: filterLibraryApps(apps.value, { filter: 'all' }).length },
   { key: 'steam', label: 'Steam', count: filterLibraryApps(apps.value, { filter: 'steam' }).length },
   { key: 'manual', label: 'Manual', count: filterLibraryApps(apps.value, { filter: 'manual' }).length },
+  { key: 'emulator', label: 'Emulators', count: filterLibraryApps(apps.value, { filter: 'emulator' }).length },
   { key: 'fast_action', label: 'Fast Action', count: filterLibraryApps(apps.value, { filter: 'fast_action' }).length },
   { key: 'running', label: 'Running', count: filterLibraryApps(apps.value, { filter: 'running', currentApp: currentApp.value }).length },
 ]).filter((filter) => filter.key === 'all' || filter.count > 0))
@@ -1154,6 +1293,7 @@ const importPools = computed(() => ({
   steam: steamGames.value,
   lutris: lutrisGames.value,
   heroic: heroicGames.value,
+  emulator: emulatorGames.value,
 }))
 const importSources = computed(() => ([
   {
@@ -1174,9 +1314,15 @@ const importSources = computed(() => ([
     ...summarizeImportGames(heroicGames.value),
     activeClass: 'border-accent/30 bg-accent/10 text-accent-bright',
   },
+  {
+    key: 'emulator',
+    label: 'ROM folders',
+    ...summarizeImportGames(emulatorGames.value),
+    activeClass: 'border-success/30 bg-success/10 text-success',
+  },
 ]).filter((source) => importPools.value[source.key]?.length > 0))
 const hasImportSources = computed(() => importSources.value.length > 0)
-const allImportGames = computed(() => [...steamGames.value, ...lutrisGames.value, ...heroicGames.value])
+const allImportGames = computed(() => [...steamGames.value, ...lutrisGames.value, ...heroicGames.value, ...emulatorGames.value])
 const availableImportCount = computed(() => allImportGames.value.filter((game) => !game.already_imported).length)
 const selectedImportCount = computed(() => allImportGames.value.filter((game) => game.selected && !game.already_imported).length)
 const importedImportCount = computed(() => allImportGames.value.filter((game) => game.already_imported).length)
@@ -1217,6 +1363,7 @@ function sourceBadgeClass(source) {
     steam: 'bg-info/10 text-info',
     lutris: 'bg-warning/10 text-warning',
     heroic: 'bg-accent/10 text-accent-bright',
+    emulator: 'bg-success/10 text-success',
   }[source] || 'bg-void/60 text-silver'
 }
 
@@ -1255,11 +1402,16 @@ function sourceLabel(source = '') {
     steam: 'Steam',
     lutris: 'Lutris',
     heroic: 'Heroic',
+    emulator: 'Emulator',
   }[source] || source || 'Unknown'
 }
 
+function importSourceChip(game) {
+  return game.emulator_label || sourceLabel(game.source)
+}
+
 function importGameKey(game) {
-  return game.appid || game.slug || game.name
+  return game.appid || game.slug || game.rom_path || game.name
 }
 
 function importGameStateLabel(game) {

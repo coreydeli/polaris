@@ -15,12 +15,55 @@ like any change to the published list, makes Polaris rebuild it, which can inter
 session. Open an entry to edit it or to export its `.art` launcher file for front ends that want a
 direct launch.
 
-**Import games** scans Steam, Lutris, and Heroic for installed titles, keeps entries that are
-already published visible so you can spot what is new, and lets you stage several candidates
+**Import games** scans Steam, Lutris, Heroic and the ROM folders you register for installed
+titles, keeps entries that are already published visible so you can spot what is new, and lets you stage several candidates
 before one import pass. Imported Steam titles keep their app id and take the Linux launch mode
 you have selected when they start.
 
 Importing a Lutris or Heroic title also publishes an entry for the launcher itself, once, using the command that exists on this host. Those imports launch straight into a game, so without it there is no way to reach the launcher from a stream to install something or fix a login. An entry you added by hand is recognised and not duplicated.
+
+### ROM folders
+
+Emulator games come in the same way; [Emulators and ROM folders](emulators.md) walks the whole
+path, from keys and BIOS files to what happens on End Session. In the import console, add a folder and pick the emulator
+that loads it. Polaris lists every file with a matching extension as a candidate, named from its
+filename with the region and version tags removed and `Legend of Zelda, The` read as `The Legend
+of Zelda`, and skips update and DLC dumps (`[v65536]`, `[UPD]`, `(DLC)`, or a folder called
+`updates` or `dlc`). A second dump of the same game, another region say, does not become a second
+entry. The folder is remembered, so **Rescan Sources** finds games you add later.
+
+An imported entry launches the emulator straight into the game, fullscreen where the emulator has
+a switch for it, with the **Emulated Gamepad Type** set for the platform: a Switch Pro pad for
+Eden, a DualSense for the PlayStation emulators. A cover that already sits next to the game
+(`<name>.png`, or in a `covers`, `boxart` or `media` folder beside it), in ES-DE's downloaded
+media for that system, or among RetroArch's boxarts for it, is copied in at import, so the entry
+has art without any key; otherwise covers come from SteamGridDB when an API key is set in Settings,
+like any entry without artwork of its own. The emulator itself is published once
+next to its games so its own UI stays reachable from a stream.
+
+Polaris looks for each emulator in this order: the emulator file you set on the folder (an
+AppImage, say), a binary on the service's `PATH`, then the Flatpak. A folder whose emulator is not
+installed still imports; the entries launch once it is. The folder card also names what the
+emulator still lacks before a game boots, with the fix: Eden's `prod.keys`, Cemu's `keys.txt`, a
+BIOS image for DuckStation or PCSX2, or a Flatpak that has not been allowed to read the folder.
+Library health counts the folders that are ready.
+
+| Emulator | Files | Command Polaris writes |
+| --- | --- | --- |
+| Eden (Nintendo Switch) | nsp, xci, nca, nro, nso | `eden -f -g '<rom>'` |
+| Dolphin (GameCube and Wii) | iso, gcm, wbfs, rvz, ciso, gcz, wia, wad, dol, elf | `dolphin-emu -b -e '<rom>'` |
+| Cemu (Wii U) | wua, wud, wux, rpx | `Cemu -f -g '<rom>'` |
+| DuckStation (PlayStation) | cue, chd, iso, pbp, m3u, img, ecm, mds | `duckstation-qt -batch -fullscreen '<rom>'` |
+| PCSX2 (PlayStation 2) | iso, chd, cso, zso, gz, bin, elf | `pcsx2-qt -batch -fullscreen '<rom>'` |
+| PPSSPP (PlayStation Portable) | iso, cso, chd, pbp | `PPSSPPSDL '<rom>'`, fullscreen follows PPSSPP's own setting |
+| mGBA (Game Boy Advance) | gba, gb, gbc, sgb | `mgba-qt -f '<rom>'` |
+
+A Flatpak runs as `flatpak run <app id>` with the same arguments, and it has to be allowed to read
+the folder: Flatseal, or `flatpak override --user --filesystem=<folder> <app id>`. For any other
+emulator choose **Custom command**, give the command with `{rom}` where the file goes, for example
+`retroarch -f -L ~/.config/retroarch/cores/snes9x_libretro.so {rom}`, and the extensions to look
+for. The file path is single-quoted when it is substituted, and `~/` at the start of an argument is
+expanded; the command runs without a shell, so nothing else is.
 
 **Library health** shows import coverage and the host context the library depends on. Keep
 entries short and recognisable on a handheld screen, use per-app overrides only where a launcher,
@@ -64,7 +107,7 @@ Saving writes the launcher profile immediately; there is no separate apply step.
 
 | Field | What it does |
 | --- | --- |
-| **Exit Timeout** | Seconds to wait for every app process to exit gracefully when quitting; five by default. Zero or below terminates immediately. |
+| **Exit Timeout** | Seconds to wait for every app process to exit gracefully when quitting; five by default. Zero or below terminates immediately. In a private-compositor session the wait is at least two seconds and at most thirty, so an emulator can finish writing its save. |
 | **Resolution Scale Factor** | Scales the client-requested resolution: 2000x1000 at 120 percent becomes 2400x1200. Only a value other than 100 percent overrides the client's own factor; the stream mode itself is not affected. |
 | **Continue streaming until all app processes exit** | Keeps streaming until every process the app started has ended, instead of stopping when the first one does. |
 | **Continue streaming if the application exits quickly** | Detects launcher-type apps that close right after starting something else and treats them as detached. |

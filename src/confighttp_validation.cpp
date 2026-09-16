@@ -407,6 +407,19 @@ namespace confighttp::validation {
     }
   }  // namespace
 
+  bool is_local_config_key(std::string_view key) {
+    return key == "multiseat_enabled" || key == "multiseat_config";
+  }
+
+  void preserve_local_config(const std::unordered_map<std::string, std::string> &existing,
+    nlohmann::json &payload) {
+    for (const auto *key : {"multiseat_enabled", "multiseat_config"}) {
+      payload.erase(key);
+      const auto found = existing.find(key);
+      if (found != existing.end() && !found->second.empty()) payload[key] = found->second;
+    }
+  }
+
   bool validate_config_payload(const nlohmann::json &payload, std::string &error) {
     if (!payload.is_object()) {
       error = "Config payload must be a JSON object";
@@ -540,6 +553,7 @@ namespace confighttp::validation {
     };
     constexpr std::array source_values {
       ""sv,
+      "emulator"sv,
       "heroic"sv,
       "lutris"sv,
       "manual"sv,
@@ -636,7 +650,7 @@ namespace confighttp::validation {
         }
 
         if (!contains(source_values, std::string_view {value.get<std::string>()})) {
-          error = "source must be one of manual, steam, lutris, or heroic";
+          error = "source must be one of manual, steam, lutris, heroic, or emulator";
           return false;
         }
         continue;

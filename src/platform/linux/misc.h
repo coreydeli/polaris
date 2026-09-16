@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <stop_token>
 #include <unistd.h>
 #include <vector>
 
@@ -64,6 +65,18 @@ namespace platf {
    * @brief Drop virtual display nodes from an encoder candidate list.
    */
   std::vector<render_device_candidate_t> without_virtual_display_nodes(std::vector<render_device_candidate_t> candidates);
+
+  /**
+   * @brief The argv a launch command yields when it carries POSIX shell quoting.
+   *
+   * Boost.Process splits a command string on unquoted spaces, strips only double quotes and
+   * ignores single quotes, so a single-quoted path reaches the child with its quotes attached
+   * and a path with a space arrives in two pieces. A command that uses single quotes or
+   * backslashes is split the way a shell would instead; anything else is left to Boost so
+   * plain commands keep their exact behaviour.
+   * @return The tokens, or nothing when the command needs no shell-style split or cannot be split.
+   */
+  std::optional<std::vector<std::string>> posix_command_argv(const std::string &cmd);
 
   /**
    * @brief The render node the encoder actually runs on: adapter_name when it is set,
@@ -133,6 +146,7 @@ namespace platf {
     bool timed_out = false;
     bool truncated = false;
     std::string output;
+    bool cancelled = false;
   };
 
   /**
@@ -145,7 +159,8 @@ namespace platf {
   process_output_t run_process_argv_capture(
     const std::vector<std::string> &argv,
     std::chrono::milliseconds timeout = std::chrono::seconds {2},
-    std::size_t max_output_bytes = 1024 * 1024
+    std::size_t max_output_bytes = 1024 * 1024,
+    std::stop_token stop = {}
   );
 
 }  // namespace platf

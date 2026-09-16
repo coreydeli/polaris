@@ -63,6 +63,7 @@
 #include "system_tray.h"
 #include "stream.h"
 #include "utility.h"
+#include "emulator_library.h"
 #include "launch_failure.h"
 #include "video.h"
 #include "uuid.h"
@@ -460,6 +461,26 @@ namespace proc {
       return {"", "steam"};
     }
     return {"", ""};
+  }
+
+  emulator_identity_t launcher_identity_from_emulator(const std::string &emulator) {
+    const auto normalized = boost::to_lower_copy(boost::trim_copy(emulator));
+    if (normalized.empty()) {
+      return {};
+    }
+    if (normalized == emulator_library::custom_emulator_id) {
+      return {"", "", std::string(emulator_library::custom_emulator_id), "Custom emulator"};
+    }
+    const auto *preset = emulator_library::find_preset(normalized);
+    if (preset == nullptr) {
+      return {};
+    }
+    return {
+      std::string(preset->platform_id),
+      std::string(preset->platform),
+      std::string(preset->id),
+      std::string(preset->label),
+    };
   }
 
   std::string normalize_steam_launch_mode(std::string mode) {
@@ -2076,10 +2097,14 @@ namespace proc {
       return exhausted;
     }
 
+    // graceful_timeout is how long the first SIGTERM pass waits before SIGKILL; an emulator
+    // writing its save on exit needs the app's own exit timeout here, not the two seconds the
+    // second pass keeps for whatever the first one left behind.
     bool terminate_isolated_session_processes(
       std::string_view session_instance_id,
       std::string_view reason,
-      std::vector<pidfd_handle_t> *tracked_detached_children = nullptr
+      std::vector<pidfd_handle_t> *tracked_detached_children = nullptr,
+      std::chrono::milliseconds graceful_timeout = std::chrono::milliseconds(2s)
     ) {
       if (session_instance_id.empty()) {
         return false;
@@ -2114,7 +2139,8 @@ namespace proc {
 
         BOOST_LOG(info) << "process: terminating "sv << snapshot.owned.size()
                         << " exact-generation isolated process(es) "sv << reason;
-        const bool terminated = terminate_pidfds(snapshot.owned, 2s, 1s, "isolated session process"sv);
+        const auto pass_timeout = pass == 0 ? graceful_timeout : std::chrono::milliseconds(2s);
+        const bool terminated = terminate_pidfds(snapshot.owned, pass_timeout, 1s, "isolated session process"sv);
         if (tracked_detached_children != nullptr) {
           direct_child_reap_complete = reap_exited_direct_children(
                                          snapshot.owned,
@@ -5612,6 +5638,10 @@ namespace proc {
 
   bool terminate_exact_generation_processes_for_tests(std::string_view session_instance_id) {
     return terminate_isolated_session_processes(session_instance_id, "during exact-generation test"sv);
+  }
+
+  bool terminate_exact_generation_processes_for_tests(std::string_view session_instance_id, std::chrono::milliseconds graceful_timeout) {
+    return terminate_isolated_session_processes(session_instance_id, "during exact-generation test"sv, nullptr, graceful_timeout);
   }
 
   bool exact_generation_transient_capture_failure_retries_for_tests(
@@ -9958,10 +9988,16 @@ namespace proc {
     const auto reason = _session_used_cage_compositor ?
                           "after private Steam pre-cage termination"sv :
                           "during non-cage detached-only shutdown"sv;
+    // The app's Exit Timeout is the grace the first SIGTERM gets, floored at the two seconds
+    // this path always allowed and capped so a stuck process cannot hold End Session for long.
+    const auto graceful_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::clamp(std::chrono::seconds(_app.exit_timeout), std::chrono::seconds(2), std::chrono::seconds(30))
+    );
     const bool isolated_cleanup_complete = terminate_isolated_session_processes(
       _session_instance_id,
       reason,
-      (!_session_used_cage_compositor && detached_only) ? &_detached_child_pidfds : nullptr
+      (!_session_used_cage_compositor && detached_only) ? &_detached_child_pidfds : nullptr,
+      graceful_timeout
     );
     const bool detached_authority_complete =
       _session_used_cage_compositor || !detached_only || _detached_child_authority_complete;
@@ -11959,6 +11995,8 @@ namespace proc {
           ctx.game_category = app_node.value("game-category", "");
           ctx.source = app_node.value("source", ctx.steam_appid.empty() ? "manual" : "steam");
           ctx.lutris_runner = app_node.value("lutris-runner", "");
+          ctx.emulator = app_node.value("emulator", "");
+          ctx.rom_path = app_node.value("rom-path", "");
           ctx.last_launched = app_node.value("last-launched", (int64_t)0);
           if (app_node.contains("genres") && app_node["genres"].is_array()) {
             for (const auto &g : app_node["genres"]) {

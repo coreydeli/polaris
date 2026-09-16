@@ -46,7 +46,11 @@
 #include <boost/process/v1/group.hpp>
 #include <boost/process/v1/handles.hpp>
 #include <boost/process/v1/io.hpp>
+#include <boost/process/v1/args.hpp>
+#include <boost/process/v1/exe.hpp>
+#include <boost/process/v1/search_path.hpp>
 #include <boost/process/v1/start_dir.hpp>
+#include <boost/program_options/parsers.hpp>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -322,8 +326,14 @@ namespace platf {
   process_output_t run_process_argv_capture(
       const std::vector<std::string> &argv,
       std::chrono::milliseconds timeout,
-      std::size_t max_output_bytes) {
+      std::size_t max_output_bytes,
+      std::stop_token stop) {
     process_output_t result;
+    if (stop.stop_requested()) {
+      result.cancelled = true;
+      result.exit_status = 125;
+      return result;
+    }
     if (argv.empty() || argv.front().empty()) {
       return result;
     }
@@ -336,6 +346,12 @@ namespace platf {
     }
     file_t read_end {output_pipe[0]};
     file_t write_end {output_pipe[1]};
+
+    // A failed nonblocking setup must not bypass the timeout or cancellation.
+    const int current_flags = fcntl(read_end.el, F_GETFL, 0);
+    if (current_flags < 0 || fcntl(read_end.el, F_SETFL, current_flags | O_NONBLOCK) < 0) {
+      return result;
+    }
 
     std::vector<char *> native_argv;
     native_argv.reserve(argv.size() + 1);
@@ -380,20 +396,18 @@ namespace platf {
     }
     close(write_end.release());
 
-    const int current_flags = fcntl(read_end.el, F_GETFL, 0);
-    if (current_flags >= 0) {
-      fcntl(read_end.el, F_SETFL, current_flags | O_NONBLOCK);
-    }
-
     const auto deadline = std::chrono::steady_clock::now() +
                           std::max(timeout, std::chrono::milliseconds {0});
     bool child_reaped = false;
+    bool wait_failed = false;
     bool output_closed = false;
     int wait_status = 0;
     std::array<char, 4096> buffer {};
 
     while (!child_reaped || !output_closed) {
-      while (!output_closed) {
+      // Bound each drain pass so a continuously writing child cannot starve
+      // waitpid, the deadline or a stop request.
+      for (unsigned reads = 0; !output_closed && reads < 16; ++reads) {
         const auto bytes = read(read_end.el, buffer.data(), buffer.size());
         if (bytes > 0) {
           const auto available = max_output_bytes > result.output.size() ?
@@ -420,6 +434,7 @@ namespace platf {
           child_reaped = true;
         } else if (waited < 0 && errno != EINTR) {
           child_reaped = true;
+          wait_failed = true;
         }
       }
 
@@ -428,8 +443,9 @@ namespace platf {
       }
 
       const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline && (!child_reaped || !output_closed)) {
-        result.timed_out = true;
+      if (stop.stop_requested() || now >= deadline) {
+        result.cancelled = stop.stop_requested();
+        result.timed_out = !result.cancelled;
         if (!child_reaped) {
           kill(child, SIGKILL);
           while (waitpid(child, &wait_status, 0) < 0 && errno == EINTR) {
@@ -451,11 +467,13 @@ namespace platf {
       poll(&descriptor, 1, wait_ms);
     }
 
-    if (result.timed_out) {
+    if (result.cancelled) {
+      result.exit_status = 125;
+    } else if (result.timed_out) {
       result.exit_status = 124;
-    } else if (WIFEXITED(wait_status)) {
+    } else if (!wait_failed && WIFEXITED(wait_status)) {
       result.exit_status = WEXITSTATUS(wait_status);
-    } else if (WIFSIGNALED(wait_status)) {
+    } else if (!wait_failed && WIFSIGNALED(wait_status)) {
       result.exit_status = 128 + WTERMSIG(wait_status);
     }
     return result;
@@ -734,7 +752,52 @@ std::string get_local_ip_for_gateway() {
   return local_ip;
 }
 
+  std::optional<std::vector<std::string>> posix_command_argv(const std::string &cmd) {
+    if (cmd.find('\'') == std::string::npos && cmd.find('\\') == std::string::npos) {
+      return std::nullopt;
+    }
+    try {
+      auto argv = boost::program_options::split_unix(cmd);
+      if (argv.empty() || argv.front().empty()) {
+        return std::nullopt;
+      }
+      return argv;
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "Command line could not be split like a shell, running it as written: "sv << e.what();
+      return std::nullopt;
+    }
+  }
+
   bp::child run_command(bool elevated, bool interactive, const std::string &cmd, boost::filesystem::path &working_dir, const bp::environment &env, FILE *file, std::error_code &ec, bp::group *group) {
+    // A single-quoted argument (a ROM path with a space, an AppImage under a folder with a
+    // space, the gamepad-isolation wrapper) has to reach the child as one token without its
+    // quotes, and Boost's own splitter keeps them. Split such a command the way a shell would
+    // and exec the tokens directly, so no shell ever interprets a filename.
+    if (const auto argv = posix_command_argv(cmd); argv) {
+      boost::filesystem::path exe {argv->front()};
+      if (argv->front().find('/') == std::string::npos) {
+        exe = bp::search_path(argv->front());
+        if (exe.empty()) {
+          BOOST_LOG(warning) << "Couldn't find ["sv << argv->front() << "] on PATH"sv;
+          ec = std::make_error_code(std::errc::no_such_file_or_directory);
+          return bp::child();
+        }
+      }
+      const std::vector<std::string> args(argv->begin() + 1, argv->end());
+      BOOST_LOG(debug) << "Executing ["sv << exe.string() << "] with "sv << args.size() << " shell-split arguments"sv;
+      // clang-format off
+      if (!group) {
+        if (!file) {
+          return bp::child(bp::exe = exe, bp::args = args, env, bp::start_dir(working_dir), bp::std_in < bp::null, bp::std_out > bp::null, bp::std_err > bp::null, bp::limit_handles, ec);
+        }
+        return bp::child(bp::exe = exe, bp::args = args, env, bp::start_dir(working_dir), bp::std_in < bp::null, bp::std_out > file, bp::std_err > file, bp::limit_handles, ec);
+      }
+      if (!file) {
+        return bp::child(bp::exe = exe, bp::args = args, env, bp::start_dir(working_dir), bp::std_in < bp::null, bp::std_out > bp::null, bp::std_err > bp::null, bp::limit_handles, ec, *group);
+      }
+      return bp::child(bp::exe = exe, bp::args = args, env, bp::start_dir(working_dir), bp::std_in < bp::null, bp::std_out > file, bp::std_err > file, bp::limit_handles, ec, *group);
+      // clang-format on
+    }
     // clang-format off
     if (!group) {
       if (!file) {
