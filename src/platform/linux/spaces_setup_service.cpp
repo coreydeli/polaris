@@ -2,6 +2,7 @@
 #ifdef __linux__
 #include "spaces_setup.h"
 #include "spaces_activation.h"
+#include "spaces_runtime_catalog.h"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -32,6 +33,20 @@ namespace multiseat::spaces {
       {"home_incomplete", "Steam home setup did not finish. Retry checks the saved home without replacing player data. If this persists, open Doctor & Support."},
       {"setup_failed", "Setup could not finish. Retry to check the saved progress."},
     };
+    // A download never creates a Steam home, so its words never mention one.
+    const std::map<std::string, std::string> download_messages {
+      {"downloading", "Checking and downloading the gaming runtime. You can leave this page and return later."},
+      {"runtime_ready", "The gaming runtime is downloaded and verified."},
+      {"cancelled", "The download stopped. Docker may keep verified download layers for your next retry."},
+      {"host_prerequisites", "Host setup needs attention. Recheck Docker, graphics and controller access before retrying."},
+      {"docker_unavailable", "Polaris could not reach the system Docker Engine. Recheck host setup, then retry."},
+      {"download_incomplete", "The download did not finish. Retry to reuse verified layers."},
+      {"runtime_verification_failed", "The downloaded runtime could not be verified. Spaces will not use it."},
+      {"runtime_identity_mismatch", "The gaming runtime on this PC does not match this Polaris build. Spaces will not use it."},
+      {"runtime_not_published", "This Polaris build has no approved download for this runtime."},
+      {"unsupported_platform", "This runtime requires a Linux x86-64 host."},
+      {"setup_failed", "The download could not finish. Retry to check again."},
+    };
     json strict(std::string_view payload) {
       if (payload.empty() || payload.size() > 4096) throw std::invalid_argument("setup size");
       std::set<std::string> keys;
@@ -46,15 +61,19 @@ namespace multiseat::spaces {
       return !id.empty() && id.size() <= 128 &&
         id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") == std::string_view::npos;
     }
+    bool valid_runtime_id(std::string_view id) {
+      return !id.empty() && id.size() <= 64 && id.front() != '-' &&
+        id.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") == std::string_view::npos;
+    }
     bool valid_request(const setup_request_t &r) {
       if (r.operation == "activate") return r.runtime_id.empty() && r.name.empty() && valid_gpu(r.gpu_id) &&
         profiles::valid_first_steam_request({r.request_id, "Activate"});
       if (!r.gpu_id.empty()) return false;
+      if (r.operation == "download") return r.name.empty() && valid_runtime_id(r.runtime_id) &&
+        profiles::valid_first_steam_request({r.request_id, "Download"});
       if (!profiles::valid_first_steam_request({r.request_id, r.operation == "cancel" ? "Cancel" : r.name})) return false;
       if (r.operation == "cancel") return r.runtime_id.empty() && r.name.empty();
-      return r.operation == "start" && !r.runtime_id.empty() && r.runtime_id.size() <= 64 &&
-        r.runtime_id.front() != '-' &&
-        r.runtime_id.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") == std::string::npos;
+      return r.operation == "start" && valid_runtime_id(r.runtime_id);
     }
     bool digest(std::string_view value) {
       return value.size() == 71 && value.starts_with("sha256:") &&
@@ -84,6 +103,8 @@ namespace multiseat::spaces {
       if (r.operation == "start" && body.size() == 4) {
         r.runtime_id = body.at("runtime_id").get<std::string>();
         r.name = body.at("name").get<std::string>();
+      } else if (r.operation == "download" && body.size() == 3) {
+        r.runtime_id = body.at("runtime_id").get<std::string>();
       } else if (r.operation == "activate" && body.size() == 3) {
         r.gpu_id = body.at("gpu_id").get<std::string>();
       } else if (r.operation != "cancel" || body.size() != 2) return {};
@@ -99,12 +120,24 @@ namespace multiseat::spaces {
     try {
       const auto owner_path = std::filesystem::path(journal_.string() + ".owner");
       constexpr std::string_view owner = R"({"schema":1})";
-      if (!psf::update_atomic(owner_path, 64, [&](const psf::read_result_t &existing) -> std::optional<std::string> {
-            if (existing.status != psf::read_status_e::missing && (!existing || existing.payload != owner)) return {};
-            return std::string(owner);
-          })) { fault_ = true; return; }
+      const auto claimed = psf::update_atomic(owner_path, 64, [&](const psf::read_result_t &existing) -> std::optional<std::string> {
+        if (existing.status != psf::read_status_e::missing && (!existing || existing.payload != owner)) return {};
+        return std::string(owner);
+      });
+      if (!claimed) {
+        // Contention fails immediately: an owner file that exists but could not
+        // be re-claimed is another Polaris process holding setup, not a fault.
+        std::error_code error;
+        locked_ = claimed.status == psf::write_status_e::not_committed && std::filesystem::exists(owner_path, error);
+        fault_ = true;
+        return;
+      }
       auto owned = psf::read_with_lease(owner_path, 64);
-      if (!owned.read || owned.read.payload != owner || !owned.lease) { fault_ = true; return; }
+      if (!owned.read || owned.read.payload != owner || !owned.lease) {
+        locked_ = bool(owned.read) && owned.read.payload == owner && !owned.lease;
+        fault_ = true;
+        return;
+      }
       lease_ = std::move(owned.lease);
       const auto saved = psf::read_secure(journal_, 4096, false, false);
       if (saved) {
@@ -116,7 +149,7 @@ namespace multiseat::spaces {
           body.at("reference"), body.at("image"), body.at("state"), body.at("code"), body.at("schema") == 2 ? body.at("gpu_id").get<std::string>() : std::string {}};
         const bool configuring = r.state == "configuring" || r.state == "restart_required" || r.state == "activation_failed";
         if (configuring ? !valid_gpu(r.gpu_id) : !r.gpu_id.empty()) throw std::invalid_argument("setup graphics");
-        const std::string prefix = "ghcr.io/papi-ux/polaris-worker-steam@";
+        const std::string prefix = std::string {runtime_repository} + "@";
         if (!valid_request(r.request) || r.request.operation != "start" ||
             !r.reference.starts_with(prefix) || !digest(r.reference.substr(prefix.size())) || !digest(r.image) ||
             !valid_stage(r.state, r.code))
@@ -157,8 +190,21 @@ namespace multiseat::spaces {
     json result {{"version", 1}, {"available", enabled_ && !fault_ && !closing_ && bool(lease_)},
       {"runtimes", runtimes}, {"graphics", json::array()}, {"job", nullptr},
       {"message", !enabled_ ? "Spaces already have local configuration. Manage your existing spaces below." :
+        locked_ ? "Another Polaris process is using Spaces setup. Close it, then refresh." :
         fault_ ? "Saved setup state could not be secured. Restart Polaris after saving your work. If this persists, open Doctor & Support." :
         catalog_.empty() ? "The verified gaming runtime is not published for this preview yet." : ""}};
+    // Why the job cannot be offered, as a word the console keys copy on; the
+    // message above stays the sentence a person reads.
+    const std::string unavailable = !enabled_ ? "already_configured" : locked_ ? "journal_locked" : fault_ ? "journal_fault" :
+      closing_ ? "closing" : catalog_.empty() ? "runtime_not_published" : "";
+    if (!unavailable.empty()) result["unavailable_reason"] = unavailable;
+    result["download"] = nullptr;
+    if (download_) {
+      const auto &d = *download_;
+      result["download"] = {{"request_id", d.request_id}, {"runtime_id", d.runtime_id}, {"state", d.state},
+        {"code", d.code}, {"message", download_messages.at(d.code)},
+        {"can_cancel", !closing_ && active_ && d.state == "downloading" && !cancellation_.stop_requested()}};
+    }
     if (record_) {
       const auto &r = *record_;
       const bool approved = std::any_of(catalog_.begin(), catalog_.end(), [&](const auto &runtime) {
@@ -178,6 +224,17 @@ namespace multiseat::spaces {
           "This build no longer offers the runtime saved for this setup. Existing player data is preserved." : messages.at(r.code)},
         {"can_retry", approved && !fault_ && !closing_ && !active_ && retryable(r.state)},
         {"can_cancel", !fault_ && !closing_ && active_ && r.state == "downloading" && !cancellation_.stop_requested()}};
+      // What stands between this job and its next step. Empty while it is
+      // working or waiting on the person; never a dead button without a word.
+      json blocked = json::array();
+      if (fault_) blocked.push_back("journal_fault");
+      if (closing_) blocked.push_back("closing");
+      if (!approved) blocked.push_back("runtime_withdrawn");
+      if (approved && !fault_ && (r.state == "prepared" || r.state == "activation_failed") && result["graphics"].empty())
+        blocked.push_back("no_eligible_gpu");
+      result["job"]["blocked_by"] = std::move(blocked);
+      if (fault_) result["job"]["recovery"] = {{"reference", r.reference}, {"image", r.image}, {"code", r.code},
+        {"doc_anchor", "#recover-an-interrupted-setup"}};
     }
     return result;
   }
@@ -186,13 +243,40 @@ namespace multiseat::spaces {
     if (!valid_request(request)) return 400;
     std::lock_guard lock(mutex_);
     if (!enabled_ || fault_ || closing_ || !lease_) return 503;
+    const bool downloading = download_ && download_->state == "downloading";
     if (request.operation == "cancel") {
+      // Each job is fenced by its own request: stopping a download never stops
+      // first-Space setup, and a first-Space request never stops a download.
+      if (download_ && download_->request_id == request.request_id) {
+        if (!downloading) return 200;
+        cancellation_.request_stop();
+        return 202;
+      }
       if (!record_ || record_->request.request_id != request.request_id) return 409;
       if (!active_) return 200;
-      if (record_->state != "downloading") return 409;
+      if (downloading || record_->state != "downloading") return 409;
       cancellation_.request_stop();
       return 202;
     }
+    if (request.operation == "download") {
+      if (std::none_of(catalog_.begin(), catalog_.end(), [&](const auto &r) { return r.id == request.runtime_id; })) return 409;
+      // One request identity names one job.
+      if (record_ && record_->request.request_id == request.request_id) return 409;
+      if (download_ && download_->request_id == request.request_id) {
+        if (download_->runtime_id != request.runtime_id) return 409;
+        if (downloading) return 202;
+        if (download_->state == "ready") return 200;
+      }
+      if (active_) return 409;
+      download_ = download_t {request.request_id, request.runtime_id, "downloading", "downloading"};
+      cancellation_ = std::stop_source {};
+      active_ = true;
+      changed_.notify_one();
+      return 202;
+    }
+    // First-Space work waits until a running download has finished, and never
+    // reuses a download's request identity.
+    if (downloading || (download_ && download_->request_id == request.request_id)) return 409;
     if (request.operation == "activate") {
       if (!record_ || record_->request.request_id != request.request_id || !operations_.activate) return 409;
       if (!record_->gpu_id.empty() && record_->gpu_id != request.gpu_id) return 409;
@@ -238,6 +322,25 @@ namespace multiseat::spaces {
     for (;;) {
       changed_.wait(lock, [&] { return closing_ || active_; });
       if (closing_ && !active_) return;
+      if (download_ && download_->state == "downloading") {
+        const auto id = download_->runtime_id;
+        const auto stop = cancellation_.get_token();
+        lock.unlock();
+        runtime_install_result_t runtime;
+        try { if (!stop.stop_requested()) runtime = operations_.install(id, stop); }
+        catch (...) { runtime.code = "setup_failed"; }
+        lock.lock();
+        // Only an identity the compiled catalog approves for this runtime counts.
+        const bool approved = runtime.ready && std::any_of(catalog_.begin(), catalog_.end(), [&](const auto &r) {
+          return r.id == id && r.matches_image_id(runtime.image);
+        });
+        download_->state = stop.stop_requested() ? "cancelled" : approved ? "ready" : "failed";
+        download_->code = stop.stop_requested() ? "cancelled" : approved ? "runtime_ready" :
+          !runtime.ready && download_messages.contains(runtime.code) ? runtime.code : "runtime_verification_failed";
+        active_ = false;
+        if (closing_) return;
+        continue;
+      }
       const auto request = record_->request;
       const auto stop = cancellation_.get_token();
       if (record_->state == "configuring") {
@@ -308,9 +411,12 @@ namespace multiseat::spaces {
       setup_operations_t {
         .install = [catalog](std::string_view id, std::stop_token stop) {
           container::local_host_t host(stop);
-          if (!inspect_setup(host, false, false).at("host_prerequisites_ready").get<bool>())
-            return runtime_install_result_t {false, "host_prerequisites", {}, {}};
-          return install_runtime(host, id, catalog, stop);
+          auto result = inspect_setup(host, false, false).at("host_prerequisites_ready").get<bool>() ?
+            install_runtime(host, id, catalog, stop) : runtime_install_result_t {false, "host_prerequisites", {}, {}};
+          // A finished, failed or stopped pull can change what Docker holds, so
+          // the next setup check asks Docker again.
+          runtime_inspection_cache().forget();
+          return result;
         },
         .prepare = [path = directory / "spaces-profiles.json"](const auto &request, std::string_view image, std::stop_token stop) {
           container::local_host_t host(stop);

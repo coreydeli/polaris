@@ -8,17 +8,33 @@
 
 #include <chrono>
 #include <memory>
+#include <stop_token>
 #include <string_view>
 
 namespace multiseat {
   inline constexpr int profile_app_id = 1347244801;
   inline constexpr std::string_view profile_app_uuid = "706f6c61-7269-4373-8000-6d756c746973";
 
+  // Every refusal names what happened (message), a stable snake_case code and
+  // the one change that fixes it (action). The HTTP layer puts them on the
+  // launch response through launch_failure on its own thread; results built on
+  // the owner thread only carry the words and never touch launch_failure.
   struct profile_launch_result_t {
     int status = 503;
-    std::string_view message = "The profile runtime is unavailable";
+    std::string_view message = "The Space's runtime is unavailable.";
+    std::string_view code;
+    std::string_view action;
     [[nodiscard]] bool prepared() const { return status == 200; }
   };
+  inline constexpr profile_launch_result_t space_runtime_unavailable_result {
+    503, "The Space's runtime did not start.", "space_runtime_unavailable", "Open Spaces in Polaris and check Host Setup."};
+  inline constexpr profile_launch_result_t space_start_timeout_result {
+    504, "The Space did not start in time.", "space_start_timeout",
+    "Try again. If it keeps happening, open Spaces in Polaris and check Host Setup."};
+  // While an administrator approves a change to this PC's setup from the Spaces page.
+  inline constexpr profile_launch_result_t spaces_host_setup_running_result {
+    409, "Polaris is changing this PC's Spaces setup.", "spaces_host_setup_running",
+    "Try again when Host Setup in Polaris finishes."};
   struct profile_begin_result_t {
     profile_launch_result_t result;
     std::optional<seat_handle_t> seat;
@@ -35,8 +51,12 @@ namespace multiseat {
     virtual std::vector<profile_summary_t> profile_catalog() const { return {}; }
     virtual spaces::library_reader_t library_reader() const { return {}; }
     virtual std::vector<std::string> desktop_clients() const { return {}; }
+    /// Devices whose Default Space is Desktop.
+    virtual std::vector<std::string> desktop_default_clients() const { return {}; }
     virtual std::vector<profile_activity_t> profile_activity() const { return {}; }
     virtual bool idle() const { return false; }
+    /// Seat and encoder usage against the trusted budget, when the controller can count it.
+    virtual std::optional<gpu_usage_t> capacity() const { return std::nullopt; }
     virtual void reconcile() = 0;
     virtual profile_begin_result_t begin(const std::shared_ptr<rtsp_stream::launch_session_t> &launch) = 0;
     virtual profile_poll_e poll(const std::shared_ptr<rtsp_stream::launch_session_t> &launch,
@@ -54,6 +74,8 @@ namespace multiseat {
     std::function<profiles::change_result_t(const profiles::steam_create_request_t &)> create;
     std::function<profiles::change_result_t(const profiles::edit_request_t &)> edit;
     std::function<profiles::change_result_t(std::string_view, std::string_view, bool)> access;
+    // Deletes a Space's home through Docker; the stop token ends a long removal at shutdown.
+    std::function<profiles::removal_result_t(const profiles::edit_request_t &, std::stop_token)> remove_for_good;
   };
   struct profile_admin_snapshot_t {
     bool available = false, changing = false, failed = false;
@@ -61,6 +83,9 @@ namespace multiseat {
     bool creation_available = false, management_available = false;
     std::vector<std::string> desktop_clients;
     std::vector<profile_activity_t> activity;
+    std::optional<gpu_usage_t> capacity;
+    bool removal_available = false;  ///< a Space can be removed for good, not only archived
+    std::vector<std::string> desktop_default_clients;  ///< devices whose Default Space is Desktop
   };
   struct profile_session_snapshot_t {
     bool active = false;
@@ -73,17 +98,30 @@ namespace multiseat {
     std::string id, name, state;
     bool selected = false;
     bool library_enabled = false;
+    bool can_open = false;  ///< this device could open it right now, the host's capacity included
+    std::string blocked_reason;  ///< when not: unavailable | in_use | starting | running | stopping | at_capacity
   };
+  // What a device may see, and why what it cannot do is off. Every reason is a
+  // stable snake_case word a client can key copy on; the six state words stay.
   struct profile_client_spaces_t {
     bool available = false, can_switch = false;
     std::string selected;
     std::vector<profile_client_space_t> spaces;
     bool desktop_allowed = false;
+    std::string unavailable_reason;  ///< controller_missing | stopping | reconfiguring | admin_failed | selection_failed | no_space_assigned
+    std::string switch_blocked_reason;  ///< your_stream | desktop_stream
+    std::string default_space;  ///< where the device opens first: a Space id, "desktop" for a Desktop default, empty when none
+    std::optional<gpu_usage_t> capacity;
   };
 
   struct profile_library_snapshot_t {
     std::string id, name;
     spaces::library_t library;
+  };
+  // A removal for good says what it could not delete and where it still is.
+  struct profile_removal_result_t {
+    profile_launch_result_t result;
+    std::string kept_volume, kept_network;
   };
   class profile_launch_service_t final {
   public:
@@ -109,10 +147,16 @@ namespace multiseat {
       std::string_view previous);
     [[nodiscard]] profile_launch_result_t create_steam_profile(profiles::steam_create_request_t request);
     [[nodiscard]] profile_launch_result_t edit_profile(profiles::edit_request_t request);
+    // Deletes a Space's games and saves and its record. Refused while that Space
+    // or any Space stream is active, when the typed name is not the Space's name,
+    // and for the last Steam Space. A finished request answers its own retry.
+    [[nodiscard]] profile_removal_result_t remove_space_for_good(profiles::edit_request_t request);
     // Cancellation only marks launches. Docker and input teardown remain on the
     // owner thread. Empty tokens allow an authenticated owner to cancel itself.
     [[nodiscard]] bool cancel_client(std::string_view client, std::string_view token = {});
     [[nodiscard]] std::optional<std::string> session_token(std::string_view client) const;
+    /// A launch of this device's is admitted but has not started streaming yet.
+    [[nodiscard]] bool session_starting(std::string_view client) const;
     [[nodiscard]] profile_session_snapshot_t session_snapshot(std::string_view client) const;
     void stop_admission();
     [[nodiscard]] bool shutdown(std::chrono::milliseconds timeout);

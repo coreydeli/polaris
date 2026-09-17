@@ -70,6 +70,23 @@ To keep the copy, refresh it after every update as the
 also shows the old version until the new deployment is booted; `rpm-ostree status` marks the
 booted one with `●`.
 
+### Restart from the console or the tray
+
+Under `polaris.service`, a restart asked for from the console or the tray exits with status 75
+and the unit starts the installed binary again a few seconds later, so a restart after a package
+update runs the new version. Started any other way, Polaris re-executes itself in place and keeps
+its process id. `systemctl --user stop` and `restart` always win over a pending restart: the
+process exits instead of re-executing, so a stop cannot hang until systemd's timeout.
+
+A custom unit with its own `Restart=` can opt into the same behaviour with
+`Environment=POLARIS_SERVICE_RESTART=1`; `POLARIS_SERVICE_RESTART=0` keeps the in-place restart
+under any unit.
+
+In 1.4.8 a restart request could be lost when the host happened to be running a shell command at
+that moment. The console then kept the old settings and the log ended at
+"Shutdown requested: restart requested". On such a host, `systemctl --user restart polaris` still
+works.
+
 ## Web UI does not load
 
 1. Confirm Polaris is running.
@@ -137,10 +154,12 @@ performance/capability fallback first, not a startup failure. If enabling GPU-na
 launch on a specific driver/compositor stack, temporarily set it to `disabled` and include the
 capture decision fields in the bug report.
 
-The built-in Desktop entry does not launch your existing KDE, GNOME, or wlroots desktop inside this
-private compositor. If the client connects but shows an empty or black desktop while app entries work,
-that usually means the headless runtime is alive but nothing visible has been launched in it. Use
-Desktop Display mode when you want to stream the already-running host desktop session.
+The built-in Desktop entry streams your existing KDE, GNOME, or wlroots desktop even when the host
+default is a private stream, because it has **Mirror the host desktop** turned on in the
+[app editor](apps.md#runtime-behavior). An entry with no command and that setting off opens this private
+compositor instead. If such an entry connects but shows an empty or black desktop while app entries
+work, the headless runtime is alive and nothing visible has been launched in it yet; right-click the
+empty screen to open the session menu.
 
 Unsure which mode you should be running in the first place? Start with
 [Launch modes and capture paths](launch-modes.md).
@@ -343,7 +362,8 @@ Polaris starts its own `labwc` Wayland socket for the client session.
 
 KMS/DRM capture reads framebuffers straight from the kernel, which needs `CAP_SYS_ADMIN` on the
 Polaris binary. That is deliberately opt-in: the package does not grant it, the host setup step
-does. With `capture = kms` and no capability, Polaris finds the display, logs
+does. Installing or updating the package replaces the binary, and the new one does not carry the
+capability, so run the step again after every install or update. With `capture = kms` and no capability, Polaris finds the display, logs
 `Failed to gain CAP_SYS_ADMIN` and `Couldn't get handle for DRM Framebuffer`, and then either
 substitutes another backend or, when nothing else can capture, serves with no capture at all and
 H.264 as the only codec. The Doctor reports both cases as `kms_capture_needs_capability`.

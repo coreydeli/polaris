@@ -55,6 +55,8 @@ namespace multiseat {
     std::chrono::milliseconds profile_launch_timeout {30000};
     spaces::library_reader_t library_reader;
     std::vector<std::string> desktop_clients;
+    /** Devices whose Default Space is Desktop. */
+    std::vector<std::string> desktop_default_clients;
   };
 
   /**
@@ -281,11 +283,13 @@ namespace multiseat {
     [[nodiscard]] std::vector<profile_summary_t> profile_catalog() const;
     [[nodiscard]] spaces::library_reader_t library_reader() const;
     [[nodiscard]] std::vector<std::string> desktop_clients() const;
+    [[nodiscard]] std::vector<std::string> desktop_default_clients() const;
     [[nodiscard]] std::vector<profile_activity_t> profile_activity() const;
     [[nodiscard]] std::optional<seat_state_e> seat_state(const seat_handle_t &handle) const;
     [[nodiscard]] bool shutting_down() const;
     [[nodiscard]] bool closed() const;
     [[nodiscard]] std::size_t seats() const;
+    [[nodiscard]] gpu_usage_t capacity() const;
     [[nodiscard]] std::size_t managed_workers() const;
     [[nodiscard]] std::size_t input_allocations() const;
     [[nodiscard]] std::size_t tracked_launches() const;

@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 // lib includes
 #include <boost/property_tree/ptree.hpp>
@@ -140,6 +141,8 @@ namespace nvhttp {
     int status;
     std::string message;
     std::shared_ptr<rtsp_stream::launch_session_t> launch;
+    std::string code;  ///< stable snake_case reason Nova reads as error_code; empty when the refusal has none
+    std::string action;  ///< the one change that fixes it, when there is one
   };
   // Empty only for an authenticated client with no assigned profile. Publication
   // is reauthorized after bounded worker startup and never calls the host proc.
@@ -563,6 +566,12 @@ namespace nvhttp {
     bool persistence_succeeds,
     std::string &error
   );
+  /** @brief Same as above, reporting the configuration values it would persist. */
+  bool apply_stream_display_mode_selection_for_tests(
+    const std::string &selection,
+    std::unordered_map<std::string, std::string> &persisted,
+    std::string &error
+  );
   proc::desktop_launch_safety_policy_t resolve_streaming_launch_safety_policy_for_tests(
     const args_t &args,
     bool app_uses_steam,
@@ -596,6 +605,9 @@ namespace nvhttp {
   int advertised_max_launch_refresh_rate_for_tests();
   /// Put a recorded launch refusal (or the fallback text) on a response tree; see launch_failure.h.
   void put_launch_refusal_for_tests(boost::property_tree::ptree &tree, int status, const std::string &fallback_message);
+#ifdef __linux__
+  void put_profile_launch_response_for_tests(boost::property_tree::ptree &tree, const profile_launch_response_t &response, bool resume);
+#endif
 
   void ensure_response_status_code_for_tests(
     boost::property_tree::ptree &tree,

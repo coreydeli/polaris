@@ -54,7 +54,9 @@
 #include "file_handler.h"
 #include "game_artwork.h"
 #include "game_artwork_manual.h"
+#include "game_artwork_override.h"
 #include "globals.h"
+#include "host_setup_facts.h"
 #include "httpcommon.h"
 #include "kernel_gpu_lines.h"
 #include "logging.h"
@@ -92,6 +94,7 @@
   #include "platform/linux/multiseat_launch_service.h"
 #include "platform/linux/spaces_setup.h"
 #include "platform/linux/spaces_setup_service.h"
+  #include "platform/linux/spaces_host_admin.h"
   #include <pwd.h>
   #include <sys/stat.h>
   #include <unistd.h>
@@ -100,7 +103,12 @@
 #endif
 
 #ifdef __linux__
+  #include <ifaddrs.h>
+  #include <net/if.h>
+  #include <netinet/in.h>
+
   #include "platform/linux/executable_path.h"
+  #include "platform/linux/misc.h"
   #include "platform/linux/gamescope_session_helper.h"
   #include "platform/linux/virtual_display.h"
   #include "platform/linux/session_manager.h"
@@ -111,6 +119,9 @@
   #include "platform/linux/display_topology.h"
   #include "platform/linux/wayland.h"
   #include "display_inventory_policy.h"
+  #ifdef POLARIS_BUILD_VAAPI
+    #include "platform/linux/vaapi.h"
+  #endif
 #endif
 
 using namespace std::literals;
@@ -2312,6 +2323,7 @@ namespace confighttp {
       file_tree["current_app"] = proc::proc.get_running_app_uuid();
       file_tree["host_uuid"] = http::unique_id;
       file_tree["host_name"] = config::nvhttp.sunshine_name;
+      file_tree["artwork_lookup_off"] = apps_with_artwork_lookup_off(platf::appdata(), file_tree);
 
       send_response(response, file_tree);
     } catch (std::exception &e) {
@@ -2413,6 +2425,112 @@ namespace confighttp {
     nlohmann::json output_tree;
     output_tree["status"] = true;
     send_response(response, output_tree);
+  }
+
+  std::optional<std::string> decode_app_artwork_request(std::string_view body) {
+    if (body.empty() || body.size() > 1024) return std::nullopt;
+    const auto tree = nlohmann::json::parse(body, nullptr, false);
+    if (!tree.is_object() || tree.size() != 1 || !tree.contains("uuid") || !tree["uuid"].is_string()) {
+      return std::nullopt;
+    }
+    auto uuid = tree["uuid"].get<std::string>();
+    if (!game_artwork::is_valid_uuid(uuid)) return std::nullopt;
+    return uuid;
+  }
+
+  nlohmann::json apps_with_artwork_lookup_off(const std::filesystem::path &appdata, const nlohmann::json &apps_tree) {
+    auto off = nlohmann::json::array();
+    if (!apps_tree.is_object() || !apps_tree.contains("apps") || !apps_tree["apps"].is_array()) return off;
+    for (const auto &app : apps_tree["apps"]) {
+      if (!app.is_object() || !app.contains("uuid") || !app["uuid"].is_string()) continue;
+      const auto uuid = app["uuid"].get<std::string>();
+      if (game_artwork::is_valid_uuid(uuid) && !game_artwork::automatic_artwork_lookup_enabled(appdata, uuid)) {
+        off.push_back(uuid);
+      }
+    }
+    return off;
+  }
+
+  namespace {
+    // Remove artwork and Find artwork again take the same body, {"uuid": "<app uuid>"}, and act on
+    // the uuid exactly as the app list stores it, which names its artwork directory.
+    std::optional<std::string> read_app_artwork_uuid(resp_https_t response, req_https_t request) {
+      std::array<char, 1025> bytes;
+      request->content.read(bytes.data(), bytes.size());
+      const auto count = request->content.gcount();
+      if (count > 1024) {
+        bad_request(response, request, "Artwork request is too large");
+        return std::nullopt;
+      }
+      const auto uuid = decode_app_artwork_request({bytes.data(), static_cast<std::size_t>(count)});
+      if (!uuid) {
+        bad_request(response, request, "Invalid artwork request");
+        return std::nullopt;
+      }
+      const auto apps = proc::proc.get_apps();
+      const auto app = std::find_if(apps.begin(), apps.end(), [&](const proc::ctx_t &candidate) {
+        return boost::iequals(candidate.uuid, *uuid);
+      });
+      if (app == apps.end()) {
+        not_found(response, request);
+        return std::nullopt;
+      }
+      return app->uuid;
+    }
+  }  // namespace
+
+  /**
+   * @brief Remove artwork: delete every image downloaded or picked for an app, and stop Polaris
+   *        looking artwork up for it. The app's own image stays.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/apps/artwork/remove| POST| {"uuid":"aaaa-bbbb"}}
+   */
+  void removeAppArtwork(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+    const auto uuid = read_app_artwork_uuid(response, request);
+    if (!uuid) return;
+    const auto appdata = platf::appdata();
+    const bool removed = game_artwork::remove_downloaded_artwork(appdata, *uuid);
+    const bool lookup = game_artwork::automatic_artwork_lookup_enabled(appdata, *uuid);
+    nlohmann::json output;
+    output["status"] = removed;
+    output["uuid"] = *uuid;
+    output["automatic_lookup"] = lookup;
+    if (!removed) {
+      output["error"] = lookup ? "Polaris could not remove the artwork for this entry." :
+                                 "Polaris stopped looking up artwork for this entry, but some pictures could not be deleted.";
+      BOOST_LOG(warning) << "Remove artwork was incomplete for " << *uuid;
+    }
+    send_response(response, output);
+  }
+
+  /**
+   * @brief Find artwork again: let Polaris look up artwork for an app after Remove artwork.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/apps/artwork/find| POST| {"uuid":"aaaa-bbbb"}}
+   */
+  void findAppArtwork(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+    const auto uuid = read_app_artwork_uuid(response, request);
+    if (!uuid) return;
+    const auto appdata = platf::appdata();
+    const bool enabled = game_artwork::enable_automatic_artwork_lookup(appdata, *uuid);
+    nlohmann::json output;
+    output["status"] = enabled;
+    output["uuid"] = *uuid;
+    output["automatic_lookup"] = game_artwork::automatic_artwork_lookup_enabled(appdata, *uuid);
+    if (!enabled) output["error"] = "Polaris could not turn artwork lookup back on for this entry.";
+    send_response(response, output);
   }
 
   /**
@@ -4213,12 +4331,58 @@ namespace confighttp {
     if (count > 4096) { bad_request(response, request, "Setup request is too large"); return; }
     const auto action = multiseat::spaces::decode_setup_request({bytes.data(), static_cast<std::size_t>(count)});
     if (!action) { bad_request(response, request, "Invalid Spaces setup request"); return; }
-    const auto status = service->submit(*action);
+    // A change to this PC's setup that an administrator is approving finishes first.
+    const bool host_setup_running = action->operation != "cancel" && multiseat::spaces::host_admin_running();
+    const auto status = host_setup_running ? 409 : service->submit(*action);
     auto output = service->snapshot();
     output["accepted"] = status == 200 || status == 202;
+    if (host_setup_running) output["error"] = "Polaris is changing this PC's Spaces setup. Try again when it finishes.";
     SimpleWeb::CaseInsensitiveMultimap headers;
     append_json_security_headers(headers);
     response->write(static_cast<SimpleWeb::StatusCode>(status), output.dump(), headers);
+#else
+    not_found(response, request);
+#endif
+  }
+
+  void getSpacesHostAction(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+#ifdef __linux__
+    if (const auto service = multiseat::spaces::installed_host_admin_service()) {
+      send_response(response, service->snapshot());
+      return;
+    }
+#endif
+    not_found(response, request);
+  }
+
+  /**
+   * @brief Ask for administrator approval on this PC to fix one Spaces host check.
+   *
+   * The body names one action from a closed list and a request id:
+   * @code{.json}
+   * {"action": "security_install", "request_id": "<uuid>"}
+   * @endcode
+   * Polaris runs pkexec with the packaged helper; the password prompt opens on this PC's desktop.
+   */
+  void updateSpacesHostAction(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request) || !validateContentType(response, request, "application/json")) return;
+#ifdef __linux__
+    const auto service = multiseat::spaces::installed_host_admin_service();
+    if (!service) { not_found(response, request); return; }
+    std::array<char, 4097> bytes;
+    request->content.read(bytes.data(), bytes.size());
+    const auto count = request->content.gcount();
+    if (count > 4096) { bad_request(response, request, "Host setup request is too large"); return; }
+    const auto action = multiseat::spaces::decode_host_action_request({bytes.data(), static_cast<std::size_t>(count)});
+    if (!action) { bad_request(response, request, "Invalid host setup request"); return; }
+    const auto result = service->submit(*action);
+    auto output = service->snapshot();
+    output["accepted"] = result.status == 200 || result.status == 202;
+    if (result.refusal) output["refusal"] = {{"code", result.refusal->code}, {"message", result.refusal->message}};
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    append_json_security_headers(headers);
+    response->write(static_cast<SimpleWeb::StatusCode>(result.status), output.dump(), headers);
 #else
     not_found(response, request);
 #endif
@@ -4228,11 +4392,13 @@ namespace confighttp {
     server.resource["^/api/spaces/setup$"]["GET"] = getSpacesSetup;
     server.resource["^/api/spaces/setup/job$"]["GET"] = getSpacesSetupJob;
     server.resource["^/api/spaces/setup/job$"]["POST"] = withCsrf(updateSpacesSetupJob);
+    server.resource["^/api/spaces/setup/host-action$"]["GET"] = getSpacesHostAction;
+    server.resource["^/api/spaces/setup/host-action$"]["POST"] = withCsrf(updateSpacesHostAction);
   }
 
   void getMultiseatProfiles(resp_https_t response, req_https_t request) {
     if (!authenticate(response, request)) return;
-    nlohmann::json output {{"enabled", false}, {"available", false}, {"changing", false},
+    nlohmann::json output {{"schema", 1}, {"enabled", false}, {"available", false}, {"changing", false},
       {"failed", false}, {"profiles", nlohmann::json::array()}, {"activity", nlohmann::json::array()}, {"creation_available", false}, {"management_available", false}, {"access_available", false}};
 #ifdef __linux__
     if (const auto service = multiseat::installed_profile_service()) {
@@ -4242,7 +4408,11 @@ namespace confighttp {
       output["creation_available"] = state.creation_available;
       output["management_available"] = state.management_available;
       output["access_available"] = state.management_available;
+      output["removal_available"] = state.removal_available;
       output["desktop_clients"] = state.desktop_clients;
+      output["desktop_default_clients"] = state.desktop_default_clients;
+      if (state.capacity)
+        output["capacity"] = {{"concurrent_limit", state.capacity->max_seats}, {"concurrent_active", state.capacity->active_seats}};
       for (const auto &activity : state.activity)
         output["activity"].push_back({{"profile_id", activity.profile}, {"client_id", activity.client}, {"state", activity.state}});
       for (const auto &profile : state.profiles)
@@ -4257,13 +4427,13 @@ namespace confighttp {
     if (!authenticate(response, request) || !validateContentType(response, request, "application/json")) return;
 #ifdef __linux__
     const auto service = multiseat::installed_profile_service();
-    if (!service) { bad_request(response, request, "Multiseat is not configured"); return; }
+    if (!service) { bad_request(response, request, "Spaces are not configured"); return; }
     std::array<char, 4097> bytes;
     request->content.read(bytes.data(), bytes.size());
     const auto count = request->content.gcount();
     if (count > 4096) { bad_request(response, request, "Creation request is too large"); return; }
     const auto creation = multiseat::profiles::decode_steam_create_request({bytes.data(), static_cast<std::size_t>(count)});
-    if (!creation) { bad_request(response, request, "Invalid profile creation request"); return; }
+    if (!creation) { bad_request(response, request, "Invalid Space creation request"); return; }
     const auto result = service->create_steam_profile(*creation);
     const nlohmann::json output {{"status", result.prepared()}, {"message", result.message},
       {"profile_id", creation->request_id}};
@@ -4286,10 +4456,23 @@ namespace confighttp {
     if (count > 4096) { bad_request(response, request, "Space change is too large"); return; }
     const auto edit = multiseat::profiles::decode_edit_request({bytes.data(), static_cast<std::size_t>(count)});
     if (!edit) { bad_request(response, request, "Invalid space change"); return; }
-    const auto result = service->edit_profile(*edit);
-    const nlohmann::json output {{"status", result.prepared()}, {"message", result.message}, {"profile_id", edit->profile_id}};
     SimpleWeb::CaseInsensitiveMultimap headers;
     append_json_security_headers(headers);
+    if (edit->operation == multiseat::profiles::edit_operation_e::remove_for_good) {
+      // Removing for good answers with its reason, its fix, and any Docker
+      // resource it could not delete, so the page can say what is still here.
+      const auto removal = service->remove_space_for_good(*edit);
+      nlohmann::json output {{"status", removal.result.prepared()}, {"message", removal.result.message},
+        {"profile_id", edit->profile_id}};
+      if (!removal.result.code.empty()) output["code"] = removal.result.code;
+      if (!removal.result.action.empty()) output["action"] = removal.result.action;
+      if (!removal.kept_volume.empty()) output["kept_volume"] = removal.kept_volume;
+      if (!removal.kept_network.empty()) output["kept_network"] = removal.kept_network;
+      response->write(static_cast<SimpleWeb::StatusCode>(removal.result.status), output.dump(), headers);
+      return;
+    }
+    const auto result = service->edit_profile(*edit);
+    const nlohmann::json output {{"status", result.prepared()}, {"message", result.message}, {"profile_id", edit->profile_id}};
     response->write(static_cast<SimpleWeb::StatusCode>(result.status), output.dump(), headers);
 #else
     not_found(response, request);
@@ -4300,7 +4483,7 @@ namespace confighttp {
     if (!authenticate(response, request) || !validateContentType(response, request, "application/json")) return;
 #ifdef __linux__
     const auto service = multiseat::installed_profile_service();
-    if (!service) { bad_request(response, request, "Multiseat is not configured"); return; }
+    if (!service) { bad_request(response, request, "Spaces are not configured"); return; }
     try {
       std::array<char, 4097> bytes;
       request->content.read(bytes.data(), bytes.size());
@@ -4344,7 +4527,7 @@ namespace confighttp {
     if (!authenticate(response, request) || !validateContentType(response, request, "application/json")) return;
 #ifdef __linux__
     const auto service = multiseat::installed_profile_service();
-    if (!service) { bad_request(response, request, "Multiseat is not configured"); return; }
+    if (!service) { bad_request(response, request, "Spaces are not configured"); return; }
     try {
       std::array<char, 4097> bytes;
       request->content.read(bytes.data(), bytes.size());
@@ -4901,7 +5084,7 @@ namespace confighttp {
     const auto vd_backend = virtual_display::detect_backend();
     const bool vd_available = virtual_display::backend_has_required_configuration(
       vd_backend,
-      config::video.linux_display.streaming_output
+      virtual_display::host_virtual_display_connector()
     );
     const auto configured_policy = stream_display_policy::resolve(stream_display_policy::input_t {
       vd_available,
@@ -5262,9 +5445,25 @@ namespace confighttp {
     }
   }
 
+  ai_optimizer::config_t ai_config_from_settings(const config::video_t::ai_optimizer_t &settings) {
+    ai_optimizer::config_t ai_cfg;
+    ai_cfg.enabled = settings.enabled;
+    ai_cfg.provider = settings.provider;
+    ai_cfg.model = settings.model;
+    ai_cfg.auth_mode = settings.auth_mode;
+    ai_cfg.api_key = settings.api_key;
+    ai_cfg.base_url = settings.base_url;
+    ai_cfg.use_subscription = settings.use_subscription;
+    ai_cfg.codex_home = settings.codex_home;
+    ai_cfg.timeout_ms = settings.timeout_ms;
+    ai_cfg.cache_ttl_hours = settings.cache_ttl_hours;
+    return ai_cfg;
+  }
+
   bool write_config_tree(resp_https_t response, req_https_t request, const nlohmann::json &tree, const std::string &writer,
                          doctor_actions::paired_global_control_guard_t &authority,
-                         const std::optional<std::string> &observed_revision = std::nullopt) {
+                         const std::optional<std::string> &observed_revision = std::nullopt,
+                         bool *restart_required = nullptr) {
     const auto before = expected_configuration_revision(request).value_or(
       observed_revision.value_or(configuration_store::revision(config::sunshine.config_file, true)));
     std::stringstream config_stream;
@@ -5313,8 +5512,38 @@ namespace confighttp {
       const bool enabled = json_config_enabled(tree["adaptive_bitrate_enabled"]);
       if (enabled != adaptive_bitrate::get_state().configured_enabled) authority.set_adaptive_enabled(enabled);
     }
-    if (tree.contains("ai_enabled")) {
-      ai_optimizer::set_enabled(json_config_enabled(tree["ai_enabled"]));
+    // Apply what the running host can take without a restart, from what is now
+    // on disk, and tell the caller whether anything else changed.
+    auto written_vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+    const auto changed = validation::changed_config_keys(existing_vars, written_vars);
+    if (restart_required) {
+      // Against the file this process loaded at start, not the file before this save: an earlier
+      // change that still waits for a restart keeps saying so, and one reverted needs none. A process
+      // that never read a configuration file compares against the file before this save.
+      const auto loaded = config::loaded_config_file_vars();
+      *restart_required = validation::written_config_requires_restart(loaded ? *loaded : existing_vars, written_vars);
+    }
+    if (std::find(changed.begin(), changed.end(), "steamgriddb_api_key") != changed.end()) {
+      const auto it = written_vars.find("steamgriddb_api_key");
+      config::set_steamgriddb_api_key(it == written_vars.end() ? std::string {} : it->second);
+      BOOST_LOG(info) << "SaveConfig: SteamGridDB key applied at runtime"sv;
+    }
+    // Pairing reads both through locked accessors, so the next pairing request uses them.
+    if (std::any_of(changed.begin(), changed.end(), [](const std::string &key) {
+          return key == "trusted_subnets" || key == "trusted_subnet_auto_pairing";
+        })) {
+      config::apply_trusted_network(written_vars);
+      BOOST_LOG(info) << "SaveConfig: trusted network applied at runtime"sv;
+    }
+    // Only a changed AI key reapplies: a PATCH merges into the whole file, so the
+    // tree carries every AI key on every save.
+    if (std::any_of(changed.begin(), changed.end(), [](const std::string &key) {
+          return validation::is_ai_config_key(key);
+        })) {
+      // The console server runs on one thread and is the only reader of these
+      // strings; the explanation provider takes its own locked copy.
+      config::video.ai_optimizer = config::ai_optimizer_settings(written_vars);
+      ai_optimizer::reconfigure(ai_config_from_settings(config::video.ai_optimizer));
     }
     return true;
   }
@@ -5357,13 +5586,15 @@ namespace confighttp {
       const bool changes_tuning = input_tree.contains("adaptive_bitrate_enabled") &&
         json_config_enabled(input_tree["adaptive_bitrate_enabled"]) != adaptive_bitrate::get_state().configured_enabled;
       if (!configuration_current(response, request, changes_tuning)) return;
-      if (!write_config_tree(response, request, input_tree, "web_ui", authority)) {
+      bool restart_required = true;
+      if (!write_config_tree(response, request, input_tree, "web_ui", authority, std::nullopt, &restart_required)) {
         return;
       }
       nlohmann::json output_tree;
       output_tree["status"] = true;
       output_tree["configuration_revision"] = configuration_store::revision(config::sunshine.config_file);
       output_tree["live_tuning"] = live_tuning::snapshot(stream_stats::get_current());
+      output_tree["restart_required"] = restart_required;
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "SaveConfig: "sv << e.what();
@@ -5400,13 +5631,15 @@ namespace confighttp {
       const auto observed_revision = configuration_store::revision(config::sunshine.config_file, true);
       const auto existing_vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
       const auto merged = validation::merge_config_patch(existing_vars, input_tree);
-      if (!write_config_tree(response, request, merged, "api_patch", authority, observed_revision)) {
+      bool restart_required = true;
+      if (!write_config_tree(response, request, merged, "api_patch", authority, observed_revision, &restart_required)) {
         return;
       }
       nlohmann::json output_tree;
       output_tree["status"] = true;
       output_tree["configuration_revision"] = configuration_store::revision(config::sunshine.config_file);
       output_tree["live_tuning"] = live_tuning::snapshot(stream_stats::get_current());
+      output_tree["restart_required"] = restart_required;
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "PatchConfig: "sv << e.what();
@@ -5536,6 +5769,106 @@ namespace confighttp {
   }
 
   /**
+   * @brief One SteamGridDB autocomplete request with the given key.
+   * @return The upstream HTTP status, or nothing when the request itself failed.
+   */
+  static std::optional<long> steamgriddb_autocomplete(const std::string &api_key, const std::string &game_name, std::string &search_response) {
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+      return std::nullopt;
+    }
+    const std::string search_url = "https://www.steamgriddb.com/api/v2/search/autocomplete/" + http::url_escape(game_name);
+    struct curl_slist *headers = curl_slist_append(nullptr, ("Authorization: Bearer " + api_key).c_str());
+    curl_easy_setopt(curl, CURLOPT_URL, search_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_string_curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &search_response);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Polaris/1.0");
+    const CURLcode res = curl_easy_perform(curl);
+    long status = 0;
+    if (res == CURLE_OK) {
+      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    }
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    if (res != CURLE_OK) {
+      return std::nullopt;
+    }
+    return status;
+  }
+
+  /**
+   * @brief Check a SteamGridDB API key against SteamGridDB without storing it.
+   *
+   * The first-run wizard checks a typed key before saving it, or the stored
+   * key with `use_stored`. The running host only reads a saved key after a
+   * restart, so the check goes to SteamGridDB directly with the key given and
+   * answers with the same words the cover search uses.
+   *
+   * @api_examples{/api/covers/key/check| POST| {"steamgriddb_api_key":"..."}}
+   */
+  void checkCoversKey(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    std::string api_key;
+    try {
+      std::stringstream ss;
+      ss << request->content.rdbuf();
+      const auto body = nlohmann::json::parse(ss.str());
+      if (body.value("use_stored", false)) {
+        const auto saved = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+        const auto it = saved.find("steamgriddb_api_key");
+        api_key = it == saved.end() ? config::steamgriddb_api_key() : it->second;
+      } else {
+        api_key = body.value("steamgriddb_api_key", std::string {});
+      }
+    } catch (const std::exception &e) {
+      bad_request(response, request, e.what());
+      return;
+    }
+
+    nlohmann::json output;
+    const auto answer_failure = [&](const game_artwork::manual::search_failure_t &failure) {
+      output["status"] = false;
+      output["code"] = failure.code;
+      output["error"] = failure.message;
+      send_response(response, output);
+    };
+    const bool key_present = std::any_of(api_key.begin(), api_key.end(), [](unsigned char ch) {
+      return !std::isspace(ch);
+    });
+    if (!key_present) {
+      answer_failure(game_artwork::manual::classify_search_failure(false, std::nullopt));
+      return;
+    }
+
+    std::string search_response;
+    const auto upstream = steamgriddb_autocomplete(api_key, "Portal", search_response);
+    if (!upstream || *upstream < 200 || *upstream >= 300) {
+      answer_failure(game_artwork::manual::classify_search_failure(true, upstream));
+      return;
+    }
+
+    std::size_t matches = 0;
+    try {
+      const auto search_data = nlohmann::json::parse(search_response);
+      if (search_data.contains("data") && search_data["data"].is_array()) {
+        matches = search_data["data"].size();
+      }
+    } catch (const std::exception &) {
+      matches = 0;
+    }
+    output["status"] = true;
+    output["code"] = "steamgriddb_ok";
+    output["matches"] = matches;
+    send_response(response, output);
+  }
+
+  /**
    * @brief Search SteamGridDB for cover art by game name.
    * Returns a list of cover art URLs that can be downloaded.
    * Requires `steamgriddb_api_key` to be set in config.
@@ -5555,7 +5888,7 @@ namespace confighttp {
       output["covers"] = nlohmann::json::array();
       send_response(response, output);
     };
-    const auto &configured_key = config::sunshine.steamgriddb_api_key;
+    const auto configured_key = config::steamgriddb_api_key();
     const bool key_present = std::any_of(configured_key.begin(), configured_key.end(), [](unsigned char ch) {
       return !std::isspace(ch);
     });
@@ -5574,7 +5907,7 @@ namespace confighttp {
     }
 
     std::string game_name = name_it->second;
-    std::string api_key = config::sunshine.steamgriddb_api_key;
+    std::string api_key = configured_key;
 
     // Step 1: Search for the game by name
     std::string search_url = "https://www.steamgriddb.com/api/v2/search/autocomplete/" +
@@ -7001,7 +7334,7 @@ namespace confighttp {
     const bool backend_detected = cached_backend != virtual_display::backend_e::NONE;
     const bool available = virtual_display::backend_has_required_configuration(
       cached_backend,
-      config::video.linux_display.streaming_output
+      virtual_display::host_virtual_display_connector()
     );
     output_tree["available"] = available;
     const auto labwc = snapshot_labwc();
@@ -7605,6 +7938,187 @@ namespace confighttp {
   }
 #endif
 
+#ifdef __linux__
+  namespace {
+  namespace setup_facts {
+    std::string read_text(const fs::path &path, std::size_t max_bytes = 64 * 1024) {
+      std::ifstream in(path, std::ios::binary);
+      if (!in) {
+        return {};
+      }
+      std::string text(max_bytes, '\0');
+      in.read(text.data(), static_cast<std::streamsize>(max_bytes));
+      text.resize(static_cast<std::size_t>(in.gcount()));
+      return text;
+    }
+
+    std::string first_line(const fs::path &path) {
+      auto text = read_text(path, 256);
+      text = text.substr(0, text.find('\n'));
+      boost::algorithm::trim(text);
+      return text;
+    }
+
+    std::string pci_ids_model(std::string_view vendor, std::string_view device) {
+      for (const auto *path : {"/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids", "/usr/share/pci.ids"}) {
+        std::ifstream ids(path);
+        if (ids) {
+          return host_setup::pci_ids_device_name(ids, vendor, device);
+        }
+      }
+      return {};
+    }
+
+    host_setup::gpu_facts_t gpu_facts(const platf::render_device_candidate_t &candidate) {
+      host_setup::gpu_facts_t gpu;
+      gpu.render_node = candidate.path;
+      gpu.driver = candidate.driver;
+      const auto device_dir = fs::path("/sys/class/drm") / fs::path(candidate.path).filename() / "device";
+      gpu.pci_vendor = first_line(device_dir / "vendor");
+      if (gpu.driver == "nvidia") {
+        gpu.driver_version = host_setup::parse_driver_version(first_line("/sys/module/nvidia/version"));
+        std::error_code ec;
+        const auto slot = fs::canonical(device_dir, ec).filename().string();
+        // A PCI slot reads 0000:01:00.0; anything else would not name a directory here.
+        if (!ec && !slot.empty() && slot.find_first_not_of("0123456789abcdefABCDEF:.") == std::string::npos) {
+          gpu.model = host_setup::nvidia_information_model(read_text(fs::path("/proc/driver/nvidia/gpus") / slot / "information"));
+        }
+      }
+      if (gpu.model.empty()) {
+        gpu.model = pci_ids_model(gpu.pci_vendor, first_line(device_dir / "device"));
+      }
+  #ifdef POLARIS_BUILD_VAAPI
+      // NVIDIA nodes have no VA encode driver; loading the decode-only one would say nothing.
+      if (gpu.driver != "nvidia" && gpu.driver != "nouveau") {
+        const auto support = va::encode_support(candidate.path);
+        gpu.vaapi = host_setup::vaapi_facts_t {
+          .driver_loaded = support.driver_loaded,
+          .driver_vendor = support.driver_vendor,
+          .h264 = support.h264,
+          .hevc = support.hevc,
+          .av1 = support.av1,
+        };
+      }
+  #endif
+      return gpu;
+    }
+
+    /**
+     * @brief True for a real network card, or a bridge, bond or VLAN over one.
+     */
+    bool interface_hardware_backed(const std::string &name, int depth = 0) {
+      if (name.empty() || name.find('/') != std::string::npos || name == "." || name == "..") {
+        return false;
+      }
+      const auto base = fs::path("/sys/class/net") / name;
+      std::error_code ec;
+      if (fs::exists(base / "device", ec)) {
+        return true;
+      }
+      if (depth >= 2) {
+        return false;
+      }
+      try {
+        for (const auto &entry : fs::directory_iterator(base, ec)) {
+          const auto file = entry.path().filename().string();
+          if (file.rfind("lower_", 0) == 0 && interface_hardware_backed(file.substr(6), depth + 1)) {
+            return true;
+          }
+        }
+      } catch (const std::exception &) {
+        return false;
+      }
+      return false;
+    }
+  }  // namespace setup_facts
+  }  // namespace
+#endif
+
+  nlohmann::json setup_hardware_report() {
+    host_setup::hardware_inputs_t inputs;
+    inputs.build_cuda = stream_stats::build_has_cuda();
+#ifdef POLARIS_BUILD_VAAPI
+    inputs.build_vaapi = true;
+#endif
+    inputs.configured_encoder = config::video.encoder;
+    const auto selection = video::active_encoder_selection_info();
+    inputs.policy = selection.policy;
+    inputs.planned_encoder = selection.preferred_encoder;
+    inputs.active_encoder = video::active_encoder_name();
+#ifdef __linux__
+    inputs.selected_render_node = platf::effective_encoder_render_device();
+    inputs.distro_id = update_status::detect_host_distro().id;
+    std::error_code ec;
+    inputs.image_based_os = fs::exists("/run/ostree-booted", ec);
+    for (const auto &candidate : platf::render_devices()) {
+      inputs.gpus.push_back(setup_facts::gpu_facts(candidate));
+    }
+#endif
+    auto report = host_setup::hardware_report(inputs);
+    report["status"] = true;
+    report["platform"] = POLARIS_PLATFORM;
+    return report;
+  }
+
+  nlohmann::json setup_networks_report() {
+    nlohmann::json report {
+      {"status", true},
+      {"platform", POLARIS_PLATFORM},
+      {"supported", false},
+      {"networks", nlohmann::json::array()},
+    };
+#ifdef __linux__
+    std::vector<host_setup::interface_address_t> addresses;
+    ifaddrs *list = nullptr;
+    if (getifaddrs(&list) == 0) {
+      for (auto *entry = list; entry; entry = entry->ifa_next) {
+        if (!entry->ifa_addr || entry->ifa_addr->sa_family != AF_INET || !entry->ifa_netmask || !entry->ifa_name) {
+          continue;
+        }
+        host_setup::interface_address_t address;
+        address.name = entry->ifa_name;
+        address.address = ntohl(((sockaddr_in *) entry->ifa_addr)->sin_addr.s_addr);
+        address.netmask = ntohl(((sockaddr_in *) entry->ifa_netmask)->sin_addr.s_addr);
+        address.up = (entry->ifa_flags & IFF_UP) != 0;
+        address.loopback = (entry->ifa_flags & IFF_LOOPBACK) != 0;
+        address.point_to_point = (entry->ifa_flags & IFF_POINTOPOINT) != 0;
+        address.hardware_backed = setup_facts::interface_hardware_backed(address.name);
+        addresses.push_back(std::move(address));
+      }
+      freeifaddrs(list);
+      report["supported"] = true;
+    }
+    report["networks"] = host_setup::lan_networks(addresses);
+#endif
+    return report;
+  }
+
+  /**
+   * @brief The first-run GPU step's facts.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   */
+  void getSetupHardware(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+    send_response(response, setup_hardware_report());
+  }
+
+  /**
+   * @brief The first-run network step's trustable networks.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   */
+  void getSetupNetworks(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+    send_response(response, setup_networks_report());
+  }
+
   /**
    * @brief Get current stream statistics as JSON.
    * @param response The HTTP response object.
@@ -8129,18 +8643,7 @@ namespace confighttp {
 
     // Initialize AI optimizer with config
     {
-      ai_optimizer::config_t ai_cfg;
-      ai_cfg.enabled = config::video.ai_optimizer.enabled;
-      ai_cfg.provider = config::video.ai_optimizer.provider;
-      ai_cfg.model = config::video.ai_optimizer.model;
-      ai_cfg.auth_mode = config::video.ai_optimizer.auth_mode;
-      ai_cfg.api_key = config::video.ai_optimizer.api_key;
-      ai_cfg.base_url = config::video.ai_optimizer.base_url;
-      ai_cfg.use_subscription = config::video.ai_optimizer.use_subscription;
-      ai_cfg.codex_home = config::video.ai_optimizer.codex_home;
-      ai_cfg.timeout_ms = config::video.ai_optimizer.timeout_ms;
-      ai_cfg.cache_ttl_hours = config::video.ai_optimizer.cache_ttl_hours;
-      ai_optimizer::init(ai_cfg);
+      ai_optimizer::init(ai_config_from_settings(config::video.ai_optimizer));
     }
 
     // Initialize device database
@@ -8342,6 +8845,8 @@ namespace confighttp {
     server.resource["^/polaris/v1/session/timing/runs/([^/]+)$"]["GET"] = getBenchmarkRun;
     server.resource["^/polaris/v1/session/timing/runs/([^/]+)$"]["DELETE"] = deleteBenchmarkRun;
     server.resource["^/api/apps/close$"]["POST"] = withCsrf(closeApp);
+    server.resource["^/api/apps/artwork/remove$"]["POST"] = withCsrf(removeAppArtwork);
+    server.resource["^/api/apps/artwork/find$"]["POST"] = withCsrf(findAppArtwork);
     server.resource["^/api/games/scan$"]["GET"] = scanGames;
     server.resource["^/api/games/import$"]["POST"] = withCsrf(importGames);
     server.resource["^/api/library/sources$"]["GET"] = getLibrarySources;
@@ -8395,8 +8900,11 @@ namespace confighttp {
     server.resource["^/api/covers/upload$"]["POST"] = withCsrf(uploadCover);
     server.resource["^/api/covers/image$"]["GET"] = getCoverImage;
     server.resource["^/api/covers/search$"]["GET"] = searchCovers;
+    server.resource["^/api/covers/key/check$"]["POST"] = withCsrf(checkCoversKey);
     server.resource["^/api/covers/download$"]["POST"] = withCsrf(downloadCover);
     server.resource["^/api/stats/system$"]["GET"] = getSystemStats;
+    server.resource["^/api/setup/hardware$"]["GET"] = getSetupHardware;
+    server.resource["^/api/setup/networks$"]["GET"] = getSetupNetworks;
     server.resource["^/api/stats/stream$"]["GET"] = getStreamStats;
     server.resource["^/api/stats/stream-sse$"]["GET"] = getStreamStatsSSE;
     server.resource["^/api/support/network-path-probe$"]["GET"] = getNetworkPathProbe;
@@ -8435,6 +8943,9 @@ namespace confighttp {
       output["outputs"] = std::move(arr);
       output["streaming_output"] = config::video.linux_display.streaming_output;
       output["primary_output"] = config::video.linux_display.primary_output;
+      // What the kscreen-doctor Host Virtual Display fallback would borrow, which
+      // outlives streaming_output being retired by a private or desktop mode.
+      output["host_virtual_display_output"] = virtual_display::host_virtual_display_connector();
       // Suggestions when config empty
       std::string sug_stream;
       std::string sug_primary;
