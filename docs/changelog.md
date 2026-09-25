@@ -82,6 +82,18 @@ Developers: the three Vulkan codec tables share one option set, and the rc-mode-
 - Changing a device's access to a Space answers "Space access saved". It answered "Default Space saved", and when the change failed the Spaces page said the Default Space was not saved.
 - Keeps exactly `Polaris-arch-x86_64.pkg.tar.zst`, `Polaris-fedora44-x86_64.rpm`, `Polaris-steamos3.8-x86_64.pkg.tar.zst`, and `Polaris-ubuntu24.04-x86_64.deb` as the official package assets
 
+The encoder settings pages say what this GPU will actually encode. The VA-API and Vulkan tabs gain a read-only **Hardware codec support** panel that reports the result of Polaris's live probe: the active encoder plus H.264, HEVC and AV1 rows with HDR markers where the probe accepted a Main10/P010 configuration. Polaris advertises AV1 to clients whenever this hardware passes AV1 validation and falls back to HEVC when it does not, so `av1_mode` stays on its default and the panel shows what that resolves to; when a codec is off, the panel says why — you switched it off in Settings, or the encoder cannot do it. The panel refreshes after a restart from the console or tray, since changing the encoder changes what Polaris advertises.
+
+The Vulkan tab gains an encode quality select (`vk_quality`). Level 0 is the driver default and always works; higher levels trade encode speed for quality where the driver exposes them, with valid values running 0 through one less than the driver's reported maximum — four on current AMD GPUs (so 0–3), two on a Steam Deck. Polaris reads each codec's count from the probed device during encoder probing and serves it in `encoder_codec_support` as `vk_quality_max`, so the select only offers levels the driver actually exposes, level 0 until a live probe reports them. A saved value above that maximum is clamped to it when the session starts, with a warning logged; FFmpeg's own guard has an off-by-one that lets a value of exactly N through, and an explicit Vulkan selection stays strict rather than falling back to another encoder.
+
+The Vulkan rate control Auto option now means what it says. Polaris passed a raw zero to FFmpeg, which selected the driver's default rate control instead of letting FFmpeg resolve one; config value 0 now maps to FFmpeg's Vulkan auto sentinel, and because Polaris always sets a stream bitrate, auto resolves to variable bitrate when the driver advertises VBR and to constant bitrate otherwise. Explicit modes are still passed to the driver as-is and fail validation if unsupported.
+
+The VA-API tab's selects use the same styling as every other settings control; they referenced classes that do not exist in the console, so they rendered unstyled.
+
+Docs: the configuration reference gains a [VA-API Encoder](configuration.md#va-api-encoder) section and documents the Vulkan options (`vk_tune`, `vk_rc_mode`, `vk_quality`), including what auto rate control resolves to on this host and which quality levels the probed driver offers.
+
+Developers: the three Vulkan codec tables share one option set, and the rc-mode-to-FFmpeg mapping is a free function covered by unit tests; the codec support panel reads a response-only `encoder_codec_support` key on `GET /api/config`.
+
 ## v1.4.11 - 2026-09-19
 
 Host Virtual Display on KDE Plasma gets the game, the controller and the touch it was missing, Spaces keep working across an NVIDIA driver update and a reboot, Mirror Desktop streams again when the capture setting does not fit the desktop, and couch co-op gets clearer. Nova 1.4.11 comes out alongside it. Existing configurations and paired devices remain valid.
