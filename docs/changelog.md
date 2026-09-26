@@ -13,6 +13,13 @@ starts at `v1.0.0`.
   never leaves the service pointing at a binary that is gone. It reports what it removed, and says
   so plainly when there was nothing to remove.
 
+- On AMD, a still screen in H.264 or HEVC no longer streams at the full bitrate. In constant
+  bitrate, radeonsi and RADV pad frames with filler data up to the target, and FFmpeg has no
+  option to turn it off, so an idle desktop at 20 Mbps sent 20 Mbps, 99.8% of it filler. A decoder
+  discards filler data, so Polaris now removes it from each frame before sending: on an RX 7900 XTX
+  the same still screen sends about 0.04 Mbps, and every decoded picture is identical. This covers
+  VA-API and Vulkan, whose default rate control is constant bitrate. AV1 was never padded.
+
 - On AMD, the VA-API encoding quality presets are sent as the bit fields radeonsi reads, not as a
   point on the range it reports. Read as a scale, Balanced landed on the speed preset with VBAQ.
   Polaris now sends the speed preset for Prefer speed, the balanced preset with VBAQ for Balanced,
