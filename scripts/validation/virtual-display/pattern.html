@@ -7,8 +7,9 @@
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #fff; }
   canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  /* Top right: Moonlight draws its performance overlay over the top left corner. */
   #panel {
-    position: fixed; left: 2vw; top: 2vh; padding: 1.2vh 1.6vw; background: rgba(0, 0, 0, 0.9);
+    position: fixed; right: 2vw; top: 2vh; padding: 1.2vh 1.6vw; background: rgba(0, 0, 0, 0.9);
     font: 600 2.2vh/1.35 ui-monospace, "DejaVu Sans Mono", "Liberation Mono", monospace;
   }
   #role { font-size: 2.6vh; letter-spacing: 0.2em; }
@@ -166,8 +167,10 @@ function tick(timestamp) {
   }
   const hz = recent.length > 1 ? (recent.length - 1) * 1000 / (timestamp - recent[0]) : 0;
   if (frame % 15 === 0) {
+    // Seconds since the page opened, to time the run and place a stutter or a photo in it.
     const size = `${screen.width}x${screen.height} @${devicePixelRatio}x`;
-    info.textContent = failure || `${size}  ${hz.toFixed(1)} Hz  frame ${frame}`;
+    const open = Math.floor((timestamp - start) / 1000);
+    info.textContent = failure || `${size}  ${hz.toFixed(1)} Hz  frame ${frame}  ${open} s`;
   }
 
   if (draw) {

@@ -102,8 +102,9 @@ fixed bitrate, and the performance overlay on. Use standard Moonlight for both h
    moves windows that open during a stream to the stream's screen, so a window opened
    later would land in the stream.
 2. Connect from the client and start the app. The page's info line shows the size and
-   refresh rate of the screen it is on, which should be the stream's. If Hermes leaves
-   the page on the host monitor, move it with Meta+Shift+Right.
+   refresh rate of the screen it is on, which should be the stream's, and the seconds
+   since the page opened. If Hermes leaves the page on the host monitor, move it with
+   Meta+Shift+Right.
 3. Start the sampler from that terminal. It waits 10 s for the stream to settle and
    then measures for 120 s:
 
@@ -123,7 +124,10 @@ fixed bitrate, and the performance overlay on. Use standard Moonlight for both h
    shutter, 1/1000 s or faster. Leave out photos where either clock is caught between
    two values. About 7 per run gives the 20 or so per host and scenario over three runs.
 5. Note the client's overlay figures in `client.csv`. The overlay shows roughly the last
-   second, so read it at the same points in every run and enter the mean.
+   second, so read it at the same points in every run and enter the mean. Moonlight-qt
+   also logs the same figures for the whole stream as `Global video stats` when the
+   stream ends, in its `Moonlight-*.log` in `%TEMP%` on Windows and on stderr on Linux.
+   Those include the first seconds of the stream, before the sampler starts.
 6. Disconnect once the receipt is written. The sampler exits with status 1 and marks the
    receipt incomplete if it was stopped early.
 
