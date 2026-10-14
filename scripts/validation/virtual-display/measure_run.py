@@ -42,8 +42,9 @@ DEFAULT_CONFIGS = {
     "hermes": "~/.config/hermes/hermes.conf",
 }
 DEFAULT_STATS_URL = "https://localhost:47990/api/stats/stream-sse"
-# launch_page.sh names both browser profiles with this prefix.
-DEFAULT_WORKLOAD = "vdpattern-"
+# The streamed page's browser profile, as launch_page.sh names it. The reference clock on the
+# host monitor runs under vdpattern-reference and is not part of the test page.
+DEFAULT_WORKLOAD = "vdpattern-pattern"
 
 # CPU time is reported for these groups as well as the host. Kernel command names stop at 15
 # characters, so the portal processes all share one prefix.
@@ -90,6 +91,12 @@ STATS_LABELS = (
     "pacing_policy", "capture_backend_opened", "capture_backend_route", "encode_target_residency",
     "encode_target_format", "adaptive_bitrate_enabled", "adaptive_bitrate_active", "optimization_source",
 )
+# From the launch's display_mode_decision: the mode the client asked for, the mode the virtual
+# display was given, and whether a mode saved for the paired device replaced the request. The
+# stream's width and height are the client's own size whatever the display was given, so only
+# these say what was captured. Only mode strings such as 2560x1440x120 are kept.
+DISPLAY_MODE_LABELS = ("display_mode_requested", "display_mode_applied", "display_mode_pinned_by_host")
+DISPLAY_MODE = re.compile(r"[0-9]{1,5}x[0-9]{1,5}(?:x[0-9]{1,4}(?:\.[0-9]{1,3})?)?")
 
 # Settings that change the work done per frame. Names, paths, addresses and keys in the same
 # files are never read into a receipt.
@@ -105,8 +112,8 @@ CONFIG_KEYS = (
     "linux_use_cage_compositor", "linux_virtual_display_backend",
     "mouse_cursor_visible", "recording_enabled", "recording_replay_buffer", "vk_quality", "vk_rc_mode",
     "vk_tune", "virtual_display_backend", "hermes_kms_isolated_sessions", "hermes_kms_multi_output",
-    "hermes_kms_session_compositor", "vaapi_quality", "vaapi_strict_rc_buffer", "default_scale_factor",
-    "gamescope_backend", "appliance_mode",
+    "hermes_kms_session_compositor", "vaapi_quality", "vaapi_rc", "vaapi_blbrc", "vaapi_strict_rc_buffer",
+    "default_scale_factor", "gamescope_backend", "appliance_mode",
 )
 CONFIG_VALUE = re.compile(r"[\w.:/,+ -]{0,120}")
 
@@ -468,6 +475,14 @@ def select_stats(payload: dict) -> dict:
         value = payload.get(name)
         if isinstance(value, (str, int, float, bool)):
             result[name] = value
+    decision = payload.get("display_mode_decision")
+    if isinstance(decision, dict):
+        for part in ("requested", "applied"):
+            value = decision.get(part)
+            if isinstance(value, str) and DISPLAY_MODE.fullmatch(value):
+                result[f"display_mode_{part}"] = value
+        if isinstance(decision.get("pinned_by_host"), bool):
+            result["display_mode_pinned_by_host"] = decision["pinned_by_host"]
     return result
 
 
@@ -765,7 +780,7 @@ def summarize(samples: list[dict], events: list[dict], stats_records: list[dict]
             values = [record[name] for record in streaming if name in record]
             if values:
                 stats[name] = describe(values)
-        for name in STATS_LABELS:
+        for name in STATS_LABELS + DISPLAY_MODE_LABELS:
             values = [record[name] for record in streaming if name in record and name != "streaming"]
             if values:
                 stats[name] = Counter(values).most_common(1)[0][0]

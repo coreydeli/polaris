@@ -8,6 +8,7 @@ import csv
 import json
 import math
 from pathlib import Path
+import re
 import statistics
 import sys
 
@@ -24,6 +25,12 @@ CLIENT_COLUMNS = (
 PHOTO_COLUMNS = ("scenario", "host", "run", "photo", "host_clock", "stream_clock")
 # pattern.html shows seconds modulo 100.
 CLOCK_PERIOD_S = 100.0
+# A scenario's resolution, or a display mode with its frame rate: 2560x1440, 2560x1440x120.
+MODE = re.compile(r"([0-9]+)x([0-9]+)(?:x([0-9]+(?:\.[0-9]+)?))?")
+# Settings both hosts read that change the stream. A key a host's file leaves out runs on that
+# host's own default, and the defaults differ: fec_percentage is 10 in Polaris and 20 in Hermes.
+# So a key set on one host and left out on the other counts as a difference.
+MATCHED_SETTINGS = ("encoder", "fec_percentage", "max_bitrate", "minimum_fps_target", "limit_framerate")
 
 
 def number_at(*keys):
@@ -239,6 +246,14 @@ def host_order(hosts) -> list[str]:
     return sorted(set(hosts), key=lambda host: (host != "polaris", host))
 
 
+def parse_mode(text) -> tuple[int, int, float | None] | None:
+    """Width, height and frame rate, if given, from 2560x1440 or 2560x1440x120."""
+    match = MODE.fullmatch(text) if isinstance(text, str) else None
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), float(match.group(3)) if match.group(3) else None
+
+
 def check_run(run: dict, warnings: list[str]) -> None:
     name = run.get("file") or f"{run['scenario']} {run['host']} run {run['run']}"
     if "summary" not in run:
@@ -269,9 +284,27 @@ def check_run(run: dict, warnings: list[str]) -> None:
         bitrate = stats.get("bitrate_kbps") or {}
         if bitrate.get("mean") is not None and bitrate.get("max") != bitrate.get("mean"):
             warnings.append(f"{name}: Polaris changed the encoder bitrate during the run")
+        # A bitrate saved for the paired device caps what the client asks for.
+        saved, asked = number_at("paired_target_bitrate_kbps", "max")(stats), number_at("bitrate_mbps")(target)
+        if saved and asked and saved < asked * 1000:
+            warnings.append(f"{name}: Polaris has {saved:g} kbps saved as this device's bitrate, below the run's {asked * 1000:g}")
         codec = stats.get("codec")
         if codec and target.get("codec") and str(codec).lower() != str(target["codec"]).lower():
             warnings.append(f"{name}: Polaris encoded {codec}, the run asked for {target['codec']}")
+        # The virtual display takes the launch's mode, which a mode saved for the paired device
+        # replaces. The stream's width and height stay the client's own whatever the display got.
+        size, fps = parse_mode(target.get("resolution")), number_at("fps")(target)
+        applied = parse_mode(stats.get("display_mode_applied"))
+        if size and applied and (applied[:2] != size[:2] or (fps and applied[2] and abs(applied[2] - fps) > 0.5)):
+            saved_mode = " (saved for this device)" if stats.get("display_mode_pinned_by_host") is True else ""
+            asked_for = target["resolution"] + (f" at {fps:g} fps" if fps else "")
+            warnings.append(f"{name}: Polaris gave the virtual display {stats['display_mode_applied']}{saved_mode}, the run asked for {asked_for}")
+        width, height = number_at("width", "max")(stats), number_at("height", "max")(stats)
+        if size and width and height and (width, height) != size[:2]:
+            warnings.append(f"{name}: Polaris encoded {width:g}x{height:g}, the run asked for {target['resolution']}")
+        session_fps = number_at("session_target_fps", "mean")(stats)
+        if fps and session_fps and abs(session_fps - fps) > 0.5:
+            warnings.append(f"{name}: Polaris aimed for {session_fps:g} fps, the run asked for {fps:g}")
         hdr = stats.get("stream_hdr_enabled")
         if isinstance(hdr, bool) and target.get("dynamic_range") in ("sdr", "hdr") and hdr != (target["dynamic_range"] == "hdr"):
             warnings.append(f"{name}: Polaris streamed {'HDR' if hdr else 'SDR'}, the run asked for {target['dynamic_range'].upper()}")
@@ -357,16 +390,21 @@ def build_report(runs: dict, photos: list[dict], warnings: list[str]) -> dict:
             "sections": sections, "glass_to_glass_ms": glass,
         })
 
-    environments = {}
+    environments, settings = {}, {}
     for host in host_order(key[1] for key in runs):
         measured = [run for key, run in sorted(runs.items()) if key[1] == host and "environment" in run]
         if measured:
             environment_drift(host, measured, warnings)
             environments[host] = dict(environment_rows(measured))
+            settings[host] = measured[0].get("host_settings") or {}
     # The hosts are meant to share one machine and one desktop, so only their own packages differ.
     for label in ("GPU", "Kernel", "Mesa", "KWin", "PipeWire"):
         if len({rows[label] for rows in environments.values()}) > 1:
             warnings.append(f"{label} differs between hosts: " + ", ".join(f"{host} {rows[label]}" for host, rows in environments.items()))
+    for key in MATCHED_SETTINGS:
+        values = {host: host_settings.get(key, "not set") for host, host_settings in settings.items()}
+        if len(set(values.values())) > 1:
+            warnings.append(f"{key} differs between hosts: " + ", ".join(f"{host} {value}" for host, value in values.items()))
     return {"scenarios": scenarios, "environment": environments, "warnings": warnings}
 
 

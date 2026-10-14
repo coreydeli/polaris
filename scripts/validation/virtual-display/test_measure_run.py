@@ -112,8 +112,10 @@ class ProcessSamplerTests(unittest.TestCase):
             proc.process(202, "pipewire", 1, 9, start=6)
             proc.process(203, "wireplumber", 1, 9, start=6)
             proc.process(204, "xdg-desktop-por", 1, 9, start=6)
-            proc.process(205, "bash", 1, 9, start=6, cmdline="bash -c echo vdpattern-")
-            sampler = measure.ProcessSampler("polaris", ["kwin_wayland"], "vdpattern-", Path(directory))
+            proc.process(205, "bash", 1, 9, start=6, cmdline="bash -c echo vdpattern-pattern")
+            # The reference clock on the host monitor is not the streamed page.
+            proc.process(206, "firefox", 1, 20, start=7, cmdline="firefox --profile /run/user/1000/vdpattern-reference")
+            sampler = measure.ProcessSampler("polaris", ["kwin_wayland"], measure.DEFAULT_WORKLOAD, Path(directory))
             sampler.excluded.add(205)
             with patch.object(measure.time, "monotonic", return_value=50.0):
                 self.assertIsNone(sampler.sample())
@@ -131,7 +133,8 @@ class ProcessSamplerTests(unittest.TestCase):
             proc.process(202, "pipewire", 1, 11, start=6)
             proc.process(203, "wireplumber", 1, 10, start=6)
             proc.process(204, "xdg-desktop-por", 1, 12, start=6)
-            proc.process(205, "bash", 1, 99, start=6, cmdline="bash -c echo vdpattern-")
+            proc.process(205, "bash", 1, 99, start=6, cmdline="bash -c echo vdpattern-pattern")
+            proc.process(206, "firefox", 1, 60, start=7, cmdline="firefox --profile /run/user/1000/vdpattern-reference")
             with patch.object(measure.time, "monotonic", return_value=50.5):
                 cpu = sampler.sample()
 
@@ -200,6 +203,16 @@ class StatsTests(unittest.TestCase):
             "stream_path_id": "host_virtual_display", "capture_cpu_copy": False,
         })
 
+    def test_display_mode_decision_keeps_mode_strings_only(self):
+        decision = {"requested": "2560x1440x120", "applied": "1920x1080x59.94", "pinned_by_host": True}
+        self.assertEqual(measure.select_stats({"display_mode_decision": decision}), {
+            "display_mode_requested": "2560x1440x120", "display_mode_applied": "1920x1080x59.94",
+            "display_mode_pinned_by_host": True,
+        })
+        for decision in ({"requested": "Living room 1080p"}, {"applied": "1920x1080x60 "}, {"pinned_by_host": "yes"}, "1920x1080x60"):
+            with self.subTest(decision=decision):
+                self.assertEqual(measure.select_stats({"display_mode_decision": decision}), {})
+
     def test_event_lines(self):
         self.assertEqual(measure.parse_stats_event('data: {"fps": 60, "client_ip": "192.0.2.4"}'), {"fps": 60})
         for line in ("", ": keepalive", "event: stats", "data: {broken", "data: [1, 2]"):
@@ -254,6 +267,7 @@ class SettingsTests(unittest.TestCase):
         home = str(Path.home())
         text = "\n".join([
             "encoder = vaapi",
+            "vaapi_rc = vbr",
             "linux_stream_mode = host_virtual_display",
             "api_key = secret",
             "sunshine_name = desk",
@@ -267,7 +281,7 @@ class SettingsTests(unittest.TestCase):
             path = Path(directory) / "host.conf"
             path.write_text(text)
             self.assertEqual(measure.read_settings(path), {
-                "encoder": "vaapi", "linux_stream_mode": "host_virtual_display",
+                "encoder": "vaapi", "vaapi_rc": "vbr", "linux_stream_mode": "host_virtual_display",
                 "adapter_name": "(not recorded)", "output_name": "(not recorded)", "min_log_level": "debug",
             })
         self.assertEqual(measure.read_settings(Path("/nonexistent/host.conf")), {})
@@ -359,8 +373,10 @@ class SummaryTests(unittest.TestCase):
         ]
         stats = [
             {"t": 0.1, "streaming": False, "fps": 0},
-            {"t": 1.1, "streaming": True, "fps": 119.0, "encode_time_ms": 2.0, "codec": "hevc"},
-            {"t": 2.1, "streaming": True, "fps": 121.0, "encode_time_ms": 3.0, "codec": "hevc"},
+            {"t": 1.1, "streaming": True, "fps": 119.0, "encode_time_ms": 2.0, "codec": "hevc",
+             "display_mode_applied": "2560x1440x120"},
+            {"t": 2.1, "streaming": True, "fps": 121.0, "encode_time_ms": 3.0, "codec": "hevc",
+             "display_mode_applied": "2560x1440x120"},
         ]
         summary = measure.summarize(samples, events, stats, {"URLError": 1}, 120.0, 2.0, 50)
 
@@ -381,6 +397,7 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual((polaris["records"], polaris["streaming_records"]), (3, 2))
         self.assertEqual(polaris["fps"]["mean"], 120.0)
         self.assertEqual(polaris["codec"], "hevc")
+        self.assertEqual(polaris["display_mode_applied"], "2560x1440x120")
         self.assertEqual(polaris["errors"], {"URLError": 1})
         self.assertNotIn("streaming", polaris)
 

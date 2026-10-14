@@ -47,7 +47,7 @@ Points to keep in mind when reading the results:
 - The photo figure is relative. The host monitor's own display delay is subtracted out,
   so it is the delay the stream adds and is the same yardstick for both hosts. Each
   clock moves once per frame of its own display, so single photos vary by a frame or
-  so. The median of about 20 photos per host is what to compare.
+  so. The median of about 20 photos per host and scenario is what to compare.
 
 ## Setup
 
@@ -55,6 +55,20 @@ Only one host can run at a time, because Polaris and Hermes use the same ports. 
 one before starting the other.
 
 Both hosts need `min_log_level = debug` in their config file for the periodic lines.
+
+Set `encoder = vaapi` and `fec_percentage` the same in both config files. The
+defaults differ: Polaris takes 10% of the bitrate for FEC and Hermes 20%, so at
+50 Mb/s Polaris's encoder would get about 44 Mb/s and Hermes's about 39. compare_runs
+warns when these or a few other stream settings differ between hosts, and a key left
+out of one file counts as different.
+
+The VA-API rate control also differs. On AMD, Hermes always uses VBR with a one-frame
+buffer, whatever its settings say. Polaris picks CBR with a standard buffer unless
+`polaris.conf` has `vaapi_rc = vbr` and `vaapi_strict_rc_buffer = enabled`. Polaris
+avoids that pair on radeonsi by default because frames after a scene change can grow
+far past the one-frame buffer, so say which way Polaris ran when sharing results.
+Each host logs its choice at info level when the stream starts, Polaris as
+`VA-API session settings` and Hermes as `Using VBR with single frame VBV size`.
 
 Polaris:
 
@@ -64,6 +78,11 @@ Polaris:
 - `linux_capture_profile = enabled` for the capture timings.
 - `adaptive_bitrate_enabled = disabled` and `ai_enabled = disabled`, so the bitrate
   and frame rate stay where the client set them.
+- The test client's device: on the Devices page its Host view should show Display mode
+  and Stream display mode as Not set, Target bitrate as Client's choice and Adaptive
+  bitrate as Off or Not set. Leave Enable HDR on Auto and its Default Space in Spaces
+  on Desktop. A saved display mode replaces the mode the client asks for, and a saved
+  bitrate caps it. compare_runs warns about both.
 
 Hermes:
 
@@ -74,18 +93,19 @@ Hermes:
 On both hosts, add an app whose command is the absolute path of `launch_page.sh`
 followed by `pattern`. On the client, use the same device, Moonlight version and
 settings for every run: the resolution and frame rate of the scenario, HEVC, SDR, a
-fixed bitrate, and the performance overlay on.
+fixed bitrate, and the performance overlay on. Use standard Moonlight for both hosts.
 
 ## Each run
 
-1. Before connecting, open the reference clock on the host monitor:
-   `sh launch_page.sh reference`. Polaris moves windows that open during a stream to the
-   stream's screen, so it has to be open first.
+1. Before connecting, open the reference clock on the host monitor with
+   `sh launch_page.sh reference`, and the terminal the sampler will run in. Polaris
+   moves windows that open during a stream to the stream's screen, so a window opened
+   later would land in the stream.
 2. Connect from the client and start the app. The page's info line shows the size and
    refresh rate of the screen it is on, which should be the stream's. If Hermes leaves
    the page on the host monitor, move it with Meta+Shift+Right.
-3. Start the sampler. It waits 10 s for the stream to settle and then measures for
-   120 s:
+3. Start the sampler from that terminal. It waits 10 s for the stream to settle and
+   then measures for 120 s:
 
    ```sh
    python3 scripts/validation/virtual-display/measure_run.py \
@@ -101,7 +121,7 @@ fixed bitrate, and the performance overlay on.
    and that copy wins over an `api_key` line in `polaris.conf`.
 4. While it runs, photograph the host monitor and the client screen together with a fast
    shutter, 1/1000 s or faster. Leave out photos where either clock is caught between
-   two values.
+   two values. About 7 per run gives the 20 or so per host and scenario over three runs.
 5. Note the client's overlay figures in `client.csv`. The overlay shows roughly the last
    second, so read it at the same points in every run and enter the mean.
 6. Disconnect once the receipt is written. The sampler exits with status 1 and marks the
@@ -123,8 +143,9 @@ Each table cell is the mean over runs, with the lowest and highest run in bracke
 Other hosts are set against Polaris where both measured the same thing. The report ends
 with the versions each host ran with and a list of things to check before the results
 are shared: runs that stopped early, missing timing lines, a stream that did not use
-Host Virtual Display, a bitrate that moved, and versions that changed between runs or
-differ between hosts.
+Host Virtual Display, a bitrate that moved, a display mode, frame rate or bitrate other
+than the run's, and versions or stream settings that changed between runs or differ
+between hosts.
 
 `client.csv` has one row per run. Any reading may be left blank, and lines starting
 with `#` are ignored:
@@ -149,8 +170,8 @@ the kernel, CPU and GPU models, package versions, DRM connector states and the h
 settings listed in `CONFIG_KEYS` that change per-frame work. A setting whose value
 contains the home directory, or does not look like a plain value, is recorded as
 `(not recorded)`. From Polaris's stats it keeps only the fields in `STATS_NUMBERS` and
-`STATS_LABELS`, so the client's name and address are dropped. Read a receipt before
-attaching it anywhere.
+`STATS_LABELS` and the mode strings of the display mode decision, so the client's name
+and address are dropped. Read a receipt before attaching it anywhere.
 
 ## Tests
 

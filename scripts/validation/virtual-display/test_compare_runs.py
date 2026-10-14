@@ -35,6 +35,11 @@ def receipt(host="polaris", scenario="1440p120", run=1, host_cpu=20.0, **changes
             "records": 120, "streaming_records": 120, "stream_path_id": "host_virtual_display",
             "stream_display_mode": "Host Virtual Display", "codec": "hevc", "stream_hdr_enabled": False,
             "adaptive_bitrate_active": False, "bitrate_kbps": {"mean": 38000.0, "p95": 38000, "max": 38000},
+            "paired_target_bitrate_kbps": {"mean": 0.0, "p95": 0, "max": 0},
+            "width": {"mean": 2560.0, "p95": 2560, "max": 2560}, "height": {"mean": 1440.0, "p95": 1440, "max": 1440},
+            "session_target_fps": {"mean": 120.0, "p95": 120.0, "max": 120.0},
+            "display_mode_requested": "2560x1440x120", "display_mode_applied": "2560x1440x120",
+            "display_mode_pinned_by_host": False,
         }
     for path, value in changes.items():
         *parents, last = path.split("__")
@@ -182,6 +187,10 @@ class ReportTests(unittest.TestCase):
             "streaming_records": 0, "errors": {"http_401": 2}, "stream_path_id": "windowed_stream",
             "stream_display_mode": "Windowed Stream", "adaptive_bitrate_active": True, "codec": "h264",
             "stream_hdr_enabled": True, "bitrate_kbps": {"mean": 30000.0, "p95": 38000, "max": 38000},
+            "paired_target_bitrate_kbps": {"mean": 20000.0, "p95": 20000, "max": 20000},
+            "width": {"mean": 1920.0, "p95": 1920, "max": 1920},
+            "session_target_fps": {"mean": 60.0, "p95": 60.0, "max": 60.0},
+            "display_mode_applied": "1920x1080x60", "display_mode_pinned_by_host": True,
         })
         hermes = receipt("hermes", environment__modules={"hermes_kms": {"loaded": False}})
         report = report_for([bad, hermes])
@@ -195,8 +204,52 @@ class ReportTests(unittest.TestCase):
             "1440p120 polaris run 1: Polaris streamed with Windowed Stream, not Host Virtual Display",
             "1440p120 polaris run 1: Polaris adaptive bitrate was active",
             "1440p120 polaris run 1: Polaris changed the encoder bitrate during the run",
+            "1440p120 polaris run 1: Polaris has 20000 kbps saved as this device's bitrate, below the run's 50000",
             "1440p120 polaris run 1: Polaris encoded h264, the run asked for hevc",
+            "1440p120 polaris run 1: Polaris gave the virtual display 1920x1080x60 (saved for this device), the run asked for 2560x1440 at 120 fps",
+            "1440p120 polaris run 1: Polaris encoded 1920x1440, the run asked for 2560x1440",
+            "1440p120 polaris run 1: Polaris aimed for 60 fps, the run asked for 120",
             "1440p120 polaris run 1: Polaris streamed HDR, the run asked for SDR",
+        ])
+
+    def test_a_size_off_on_one_side_only(self):
+        polaris = receipt()
+        polaris["summary"]["polaris_stats"].update({
+            "display_mode_applied": "2560x1600x120", "height": {"mean": 1600.0, "p95": 1600, "max": 1600},
+        })
+        self.assertEqual(report_for([polaris])["warnings"], [
+            "1440p120 polaris run 1: Polaris gave the virtual display 2560x1600x120, the run asked for 2560x1440 at 120 fps",
+            "1440p120 polaris run 1: Polaris encoded 2560x1600, the run asked for 2560x1440",
+        ])
+
+    def test_targets_that_match_raise_nothing(self):
+        # A saved bitrate above the run's caps nothing, and 119.88 Hz is the 120 asked for.
+        polaris = receipt()
+        polaris["summary"]["polaris_stats"].update({
+            "paired_target_bitrate_kbps": {"mean": 80000.0, "p95": 80000, "max": 80000},
+            "session_target_fps": {"mean": 119.88, "p95": 119.88, "max": 119.88},
+            "display_mode_applied": "2560x1440x119.88", "display_mode_pinned_by_host": True,
+        })
+        bare = receipt(run=2)
+        for field in ("paired_target_bitrate_kbps", "width", "session_target_fps", "display_mode_applied"):
+            del bare["summary"]["polaris_stats"][field]
+        self.assertEqual(report_for([polaris, bare])["warnings"], [])
+
+    def test_mode_text(self):
+        self.assertEqual(compare.parse_mode("2560x1440"), (2560, 1440, None))
+        self.assertEqual(compare.parse_mode("1920x1080x59.94"), (1920, 1080, 59.94))
+        for text in ("", "2560", "2560x1440x", "2560 x 1440", "4k60", None, 2560):
+            with self.subTest(text=text):
+                self.assertIsNone(compare.parse_mode(text))
+
+    def test_settings_that_differ_between_hosts(self):
+        report = report_for([
+            receipt(host_settings={"min_log_level": "debug", "encoder": "vaapi", "fec_percentage": "20", "qp": "24"}),
+            receipt("polaris-mod", host_settings={"min_log_level": "debug", "encoder": "vaapi", "fec_percentage": "20"}),
+            receipt("hermes", host_settings={"min_log_level": "debug", "encoder": "vaapi"}),
+        ])
+        self.assertEqual(report["warnings"], [
+            "fec_percentage differs between hosts: polaris 20, hermes not set, polaris-mod 20",
         ])
 
     def test_versions_that_differ_or_change(self):
